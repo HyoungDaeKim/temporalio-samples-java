@@ -67,7 +67,7 @@ public class HelloGrpcServiceImpl extends HelloGrpc.HelloImplBase {
 
       @Override
       public void onError(Throwable t) {
-        log.error("Error in lotsOfGreetings", t);
+        System.err.println("Error in lotsOfGreetings: " + t.getMessage());
       }
     };
   }
@@ -93,7 +93,7 @@ public class HelloGrpcServiceImpl extends HelloGrpc.HelloImplBase {
 
       @Override
       public void onError(Throwable t) {
-        log.error("Error in bidiHello", t);
+        System.err.println("Error in bidiHello: " + t.getMessage());
       }
     };
   }
