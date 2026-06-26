@@ -20,6 +20,9 @@ It contains the following modules:
 - Java 17+
 - Local Temporal Server, easiest to get started would be using [Temporal CLI](https://github.com/temporalio/cli).
 For more options see docs [here](https://docs.temporal.io/kb/all-the-ways-to-run-a-cluster).
+```
+D:\Project\bin\server\temporal server start-dev
+```
 
 
 ## Build and run tests

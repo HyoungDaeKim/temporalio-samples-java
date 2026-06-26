@@ -1,3 +1,25 @@
+plugins {
+    /* for gRPC */
+    id 'com.google.protobuf' version '0.9.4'
+}
+
+/* for gRPC */
+protobuf {
+    protoc {
+        artifact = "com.google.protobuf:protoc:3.25.1"
+    }
+    plugins {
+        grpc {
+            artifact = 'io.grpc:protoc-gen-grpc-java:1.64.0'
+        }
+    }
+    generateProtoTasks {
+        all()*.plugins {
+            grpc {}
+        }
+    }
+}
+
 dependencies {
     // Temporal SDK
     implementation "io.temporal:temporal-sdk:$javaSDKVersion"
@@ -51,6 +73,12 @@ dependencies {
     testImplementation "org.junit.jupiter:junit-jupiter-api"
     testRuntimeOnly "org.junit.jupiter:junit-jupiter-engine"
     testRuntimeOnly "org.junit.vintage:junit-vintage-engine"
+
+    /* for gRPC */
+    runtimeOnly 'io.grpc:grpc-netty-shaded:1.64.0'
+    implementation 'io.grpc:grpc-protobuf:1.64.0'
+    implementation 'io.grpc:grpc-stub:1.64.0'
+    compileOnly 'org.apache.tomcat:annotations-api:6.0.53' // necessary for Java 9+
 
     dependencies {
         errorproneJavac('com.google.errorprone:javac:9+181-r4173-1')

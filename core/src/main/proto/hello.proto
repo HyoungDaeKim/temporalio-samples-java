@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+option java_multiple_files = true;
+option java_package = "com.example.grpc";
+option java_outer_classname = "HelloProto";
+
+service Hello {
+  rpc SayHello (HelloRequest) returns (HelloResponse); // Unary
+  rpc LotsOfReplies(HelloRequest) returns (stream HelloResponse); // Server streaming
+  rpc LotsOfGreetings(stream HelloRequest) returns (HelloResponse); // Client streaming
+  rpc BidiHello(stream HelloRequest) returns (stream HelloResponse); // Bidirectional streaming
+}
+
+message HelloRequest {
+  string name = 1;
+  int32 age = 2;
+  string message = 3;
+}
+
+message HelloResponse {
+  string greeting_message = 1;
+  string question_message = 2;
+}
