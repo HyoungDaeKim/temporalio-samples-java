@@ -86,6 +86,11 @@ dependencies {
     }
 }
 
+tasks.withType(JavaCompile).configureEach {
+    options.errorprone.disableWarningsInGeneratedCode = true
+    options.errorprone.excludedPaths = ".*/build/generated/.*"
+}
+
 task execute(type: JavaExec) {
     mainClass = findProperty("mainClass") ?: ""
     classpath = sourceSets.main.runtimeClasspath

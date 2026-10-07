@@ -11,6 +11,7 @@ subprojects {
 
     compileJava {
         options.compilerArgs << "-Werror"
+        options.encoding = "UTF-8"
     }
 
     java {

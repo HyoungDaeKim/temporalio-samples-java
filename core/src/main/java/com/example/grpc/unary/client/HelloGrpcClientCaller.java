@@ -64,7 +64,7 @@ public class HelloGrpcClientCaller {
 
           @Override
           public void onError(Throwable t) {
-              System.out.println("Error in sendClientStreamingAsync" + t.getMessage());
+            System.out.println("Error in sendClientStreamingAsync" + t.getMessage());
             finishLatch.countDown();
           }
 
