@@ -58,31 +58,23 @@ untyped.signalWithStart("setLanguage",
 
 impl 쪽을 보면 `public void exit() { this.exit = true; }`처럼 평범한 Java 메서드다. "그냥 메서드 호출로도 동작할 것 같은데 왜 애너테이션이 필요하지?"라는 의문이 자연스럽다. 답: **클라이언트는 impl 인스턴스를 호출하는 게 아니다.**
 
-```
-[Client JVM]                         [Temporal Server]              [Worker JVM]
-workflowById.exit()                                                 (워크플로 실행 중)
-    │
-    │  workflowById는 impl이 아니라
-    │  client.newWorkflowStub(...)이 리턴한
-    │  JDK Dynamic Proxy (GreetingWorkflow 인터페이스)
-    │
-    │  프록시가 호출을 가로채 인터페이스의
-    │  @SignalMethod 애너테이션을 보고
-    │  "Signal RPC로 보내라"고 판단
-    ▼
-SignalWorkflowExecution gRPC ──────► 히스토리에 WorkflowExecutionSignaled 이벤트 적재
-                                              │
-                                              │ TaskQueue에 WorkflowTask 추가
-                                              ▼
-                                     ◀─────── Worker가 Long-poll로 수신
-                                                                    │
-                                                                    │ 리플레이 중 Signal 이벤트에 도달
-                                                                    │ → GreetingWorkflowImpl.exit() 실행
-                                                                    │   (workflow 컨텍스트 안에서)
-                                                                    │   → this.exit = true
-                                                                    │
-                                                                    │ Workflow.await(() -> ... || exit)
-                                                                    │ 조건 재평가 → true → 깨어나서 return
+```mermaid
+sequenceDiagram
+    participant C as Client JVM
+    participant S as Temporal Server
+    participant W as Worker JVM<br/>(워크플로 실행 중)
+
+    Note over C: workflowById.exit() 호출<br/>workflowById는 impl이 아니라<br/>client.newWorkflowStub(...)이 리턴한<br/>JDK Dynamic Proxy<br/>(GreetingWorkflow 인터페이스)
+    Note over C: 프록시가 호출을 가로채<br/>인터페이스의 @SignalMethod<br/>애너테이션을 보고<br/>"Signal RPC로 보내라"고 판단
+
+    C->>S: SignalWorkflowExecution gRPC
+    Note over S: 히스토리에<br/>WorkflowExecutionSignaled<br/>이벤트 적재<br/>+ TaskQueue에 WorkflowTask 추가
+
+    W-->>S: Long-poll
+    S-->>W: WorkflowTask 전달
+
+    Note over W: 리플레이 중 Signal 이벤트에 도달<br/>→ GreetingWorkflowImpl.exit() 실행<br/>  (workflow 컨텍스트 안에서)<br/>  → this.exit = true
+    Note over W: Workflow.await(() -&gt; ... || exit)<br/>조건 재평가 → true<br/>→ 깨어나서 return
 ```
 
 즉 `workflowById.exit()`은 네트워크를 왕복해 **서버가 보관한 워크플로 상태 위에서** impl의 `exit()`을 실행시킨다. 겉으로는 메서드 호출이지만 바이트코드로는 `프록시 → gRPC → 서버 → Worker → impl` 경로를 탄다.
@@ -314,20 +306,22 @@ TxResult r = WorkflowClient.executeUpdateWithStart(
 
 ### 두 단계의 라이프사이클
 
-```
-클라이언트가 Update 전송
-         │
-         ▼
-① Validator 실행 (optional)
-   - 예외 throw → "Rejected"로 즉시 반환, 히스토리 적재 X
-   - 통과 → "Accepted"
-         │
-         ▼
-② Handler 실행
-   - 상태 변경, Activity 호출, Promise 대기 가능
-   - ApplicationFailure throw → "Failed"로 반환 (히스토리 적재 O)
-   - 그 외 예외 → Workflow Task 실패 → 재시도
-   - return → "Completed" (결과 클라이언트에 반환)
+```mermaid
+flowchart TD
+    start(["클라이언트가 Update 전송"])
+    val["① Validator 실행 (optional)"]
+    valReject["<b>Rejected</b> — 즉시 반환<br/>히스토리 적재 X"]
+    handler["② Handler 실행<br/>- 상태 변경, Activity 호출, Promise 대기 가능"]
+    handlerFail["<b>Failed</b> — 결과로 반환<br/>히스토리 적재 O"]
+    taskFail["<b>Workflow Task 실패</b> → 재시도"]
+    handlerDone["<b>Completed</b> — 결과 클라이언트에 반환"]
+
+    start --> val
+    val -- "예외 throw" --> valReject
+    val -- "통과 (Accepted)" --> handler
+    handler -- "ApplicationFailure throw" --> handlerFail
+    handler -- "그 외 예외" --> taskFail
+    handler -- "return" --> handlerDone
 ```
 
 ### Validator 규칙 — Query와 같은 제약
@@ -418,14 +412,22 @@ TxResult r = WorkflowClient.executeUpdateWithStart(
 
 ### 결정 트리 — "뭘 써야 하지?"
 
-```
-결과를 받을 필요가 있는가?
-├── No → Signal (상태 변경만, 비동기)
-└── Yes
-    ├── 상태 변경이 전혀 없는 단순 조회인가? → Query
-    └── 상태 변경 포함 (혹은 변경할 수도 있음)
-        ├── 호출자가 "성공/거절" 피드백 즉시 필요 → Update
-        └── 피드백 불필요 + Workflow가 결과를 별도 경로로 저장 → Signal + Query 조합
+```mermaid
+flowchart TD
+    q1{결과를 받을<br/>필요가 있는가?}
+    sig["<b>Signal</b><br/>(상태 변경만, 비동기)"]
+    q2{상태 변경이 전혀 없는<br/>단순 조회인가?}
+    qry["<b>Query</b>"]
+    q3{호출자가 '성공/거절' 피드백<br/>즉시 필요?}
+    upd["<b>Update</b>"]
+    combo["<b>Signal + Query 조합</b><br/>(Workflow가 결과를<br/>별도 경로로 저장)"]
+
+    q1 -- No --> sig
+    q1 -- Yes --> q2
+    q2 -- Yes --> qry
+    q2 -- No<br/>(상태 변경 포함) --> q3
+    q3 -- Yes --> upd
+    q3 -- No --> combo
 ```
 
 **상황별 패턴**

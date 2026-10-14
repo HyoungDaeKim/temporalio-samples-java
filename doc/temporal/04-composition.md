@@ -98,14 +98,22 @@ Promise<WorkflowExecution> started = Workflow.getWorkflowExecution(child); // �
 
 #### "부모 종료"의 범위 — continue-as-new 포함
 
-```
-부모 종료로 간주되는 상황 전부
-├── Workflow Method return (COMPLETED)
-├── 예외 throw → Workflow Execution FAILED
-├── 외부에서 Workflow Cancel (CANCELED)
-├── Timeout (TimedOut)
-├── 외부에서 Terminate
-└── continue-as-new ← 가장 자주 놓치는 케이스
+```mermaid
+flowchart TD
+    root["부모 종료로 간주되는 상황 전부"]
+    c1["Workflow Method return (COMPLETED)"]
+    c2["예외 throw → Workflow Execution FAILED"]
+    c3["외부에서 Workflow Cancel (CANCELED)"]
+    c4["Timeout (TimedOut)"]
+    c5["외부에서 Terminate"]
+    c6["continue-as-new<br/><i>← 가장 자주 놓치는 케이스</i>"]
+
+    root --> c1
+    root --> c2
+    root --> c3
+    root --> c4
+    root --> c5
+    root --> c6
 ```
 
 → `Workflow.continueAsNew(...)`는 **새 Run을 만들고 현재 Run을 끝낸다**. 그래서 ParentClosePolicy가 **작동한다**. 자식이 "같은 Workflow ID 체인에 묶여야 할 것 같은데" 왜 TERMINATE되는지 혼란의 주 원인. §21 참고.
@@ -184,20 +192,15 @@ Activity와 비슷하지만 **값이 4개**로 Activity(3개)보다 하나 더 �
 
 #### cancel이 자식에 전달되는 4단계 흐름
 
-```
-T0 (부모가 scope.cancel 또는 childFuture.cancel 호출)
- │
- ▼
-① 부모가 서버에 "RequestCancelExternalWorkflowExecution" 커맨드 전송
- │
- ▼
-② 서버가 자식 Workflow에 WorkflowExecutionCancelRequested 이벤트 적재
- │   = "자식이 cancel 요청을 수신"
- ▼
-③ 자식 Workflow가 다음 Workflow Task 처리 시 CanceledFailure 흐름을 타기 시작
- │   (안쪽 Activity cancel, cleanup 수행 등)
- ▼
-④ 자식 Workflow가 종료 (CANCELED 상태로 완료)
+```mermaid
+flowchart TD
+    t0(["T0: 부모가 scope.cancel 또는<br/>childFuture.cancel 호출"])
+    s1["① 부모가 서버에<br/>'RequestCancelExternalWorkflowExecution'<br/>커맨드 전송"]
+    s2["② 서버가 자식 Workflow에<br/>WorkflowExecutionCancelRequested 이벤트 적재<br/><i>= 자식이 cancel 요청을 수신</i>"]
+    s3["③ 자식 Workflow가 다음 Workflow Task 처리 시<br/>CanceledFailure 흐름을 타기 시작<br/><i>(안쪽 Activity cancel, cleanup 수행 등)</i>"]
+    s4["④ 자식 Workflow가 종료<br/>(CANCELED 상태로 완료)"]
+
+    t0 --> s1 --> s2 --> s3 --> s4
 ```
 
 **`ChildWorkflowCancellationType`은 부모가 이 4단계 중 어느 지점까지 블록할지**를 결정.
@@ -410,20 +413,17 @@ Nexus는 **서비스/namespace 경계를 넘는 호출**이라 cancel 전파가 
 
 #### cancel이 handler까지 전파되는 흐름
 
-```
-T0 (caller workflow가 scope.cancel 또는 opPromise.cancel 호출)
- │
- ▼
-① caller 서버에 "RequestCancelNexusOperation" 커맨드 발행
- │
- ▼ (네트워크 홉: caller 서버 → endpoint 서버)
-② endpoint 서버가 Nexus handler에게 CancelOperation 요청 전달
- │   = "handler가 cancel 요청을 수신 확인"
- ▼
-③ handler Workflow가 다음 Task에서 CanceledFailure 흐름을 타기 시작
- │   (내부 Activity/보상/cleanup 수행)
- ▼
-④ handler operation이 종료 (CANCELED/FAILED/COMPLETED 상태)
+```mermaid
+flowchart TD
+    t0(["T0: caller workflow가 scope.cancel<br/>또는 opPromise.cancel 호출"])
+    s1["① caller 서버에<br/>'RequestCancelNexusOperation' 커맨드 발행"]
+    s2["② endpoint 서버가 Nexus handler에게<br/>CancelOperation 요청 전달<br/><i>= handler가 cancel 요청을 수신 확인</i>"]
+    s3["③ handler Workflow가 다음 Task에서<br/>CanceledFailure 흐름을 타기 시작<br/><i>(내부 Activity/보상/cleanup 수행)</i>"]
+    s4["④ handler operation이 종료<br/>(CANCELED/FAILED/COMPLETED 상태)"]
+
+    t0 --> s1
+    s1 -- "네트워크 홉:<br/>caller 서버 → endpoint 서버" --> s2
+    s2 --> s3 --> s4
 ```
 
 → **단일 서비스 안의 Child보다 네트워크 홉이 1~2개 더 많아**, "요청 보냄 ↔ 실제 handler가 받음" 사이 지연이 크고 실패 가능성도 높다.

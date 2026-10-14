@@ -6,28 +6,37 @@ Temporal Java 샘플(`core/src/main/java/io/temporal/samples/hello/HelloActivity
 
 ## 전체 흐름 한눈에 보기
 
-```
-ClientConfigProfile.load()                     # 환경변수/설정파일 로드
-          │
-          ▼
-WorkflowServiceStubs  ◀── WorkflowServiceStubsOptions   (gRPC 커넥션 레이어)
-          │
-          ▼
-WorkflowClient        ◀── WorkflowClientOptions         (워크플로 시작/시그널/쿼리 API)
-          │
-          ├─────────────► newWorkflowStub(...)   # 클라이언트 측: 워크플로 호출
-          │
-          ▼
-WorkerFactory         ◀── WorkerFactoryOptions          (워커 공용 설정)
-          │
-          ▼
-Worker                ◀── WorkerOptions                 (TaskQueue별 폴러/동시성)
-          │
-          ├── registerWorkflowImplementationTypes(...)
-          └── registerActivitiesImplementations(...)
-          │
-          ▼
-factory.start()                                        # 워커가 TaskQueue 폴링 시작
+```mermaid
+flowchart TD
+    config["ClientConfigProfile.load()<br/>환경변수·설정파일 로드"]
+    stubs["WorkflowServiceStubs<br/><i>gRPC 커넥션 레이어</i>"]
+    client["WorkflowClient<br/><i>워크플로 시작·시그널·쿼리 API</i>"]
+    newStub["newWorkflowStub(...)<br/><i>클라이언트 측 워크플로 호출</i>"]
+    factory["WorkerFactory<br/><i>워커 공용 설정</i>"]
+    worker["Worker<br/><i>TaskQueue별 폴러·동시성</i>"]
+    regWf["registerWorkflowImplementationTypes(...)"]
+    regAct["registerActivitiesImplementations(...)"]
+    start(["factory.start()<br/>워커가 TaskQueue 폴링 시작"])
+
+    stubsOpt(["WorkflowServiceStubsOptions"])
+    clientOpt(["WorkflowClientOptions"])
+    factoryOpt(["WorkerFactoryOptions"])
+    workerOpt(["WorkerOptions"])
+
+    config --> stubs
+    stubs --> client
+    client -. "클라이언트 측 분기" .-> newStub
+    client --> factory
+    factory --> worker
+    worker --> regWf
+    worker --> regAct
+    regWf --> start
+    regAct --> start
+
+    stubsOpt -. options .-> stubs
+    clientOpt -. options .-> client
+    factoryOpt -. options .-> factory
+    workerOpt -. options .-> worker
 ```
 
 4개 구성요소는 **아래로 갈수록 범위가 좁아진다**: Stubs(물리 커넥션) → Client(네임스페이스/직렬화) → WorkerFactory(JVM 내 모든 워커 공통) → Worker(한 TaskQueue 단위).
@@ -76,7 +85,7 @@ factory.start()                                        # 워커가 TaskQueue 폴
 
 | # | 파일 | 다루는 내용 |
 | --- | --- | --- |
-| 11 | [Worker 실행 모델과 Sticky Queue](temporal/11-worker-execution-model.md) | `Workflow.await()` vs `while` 루프, Stub과 Worker의 역할 차이, 다른 `WORKFLOW_ID`의 독립성, pull 기반 task 분산, K8s에서 Pod=Worker 매핑, Sticky Queue 생명주기·fallback·설정값·관찰 지표. |
+| 11 | [Worker 실행 모델과 Sticky Queue](temporal/11-worker-execution-model.md) | `Workflow.await()` vs `while` 루프, **Stub은 "리모컨"일 뿐 — 실제 workflow 메서드 바디는 Worker가 실행**, 다른 `WORKFLOW_ID`의 독립성, **pull 기반 long-poll task 분산** (Normal+Sticky 두 세트 polling), K8s에서 Pod=Worker 매핑, Sticky Queue 생명주기·fallback·설정값·관찰 지표. |
 | 12 | [gRPC Retry (전송 계층 재시도)](temporal/12-grpc-retry.md) | `GrpcRetryer` facade와 Sync/Async 구현, `BackoffThrottler` 공식과 congestion 분기, `GrpcRetryerUtils` 재시도 정책 결정기, `RpcRetryOptions` 기본값, 실제 호출 지점(`GenericWorkflowClientImpl` 등), `GrpcMetricsInterceptor` 자동 계측, 서버 측 `RetryPolicy`와의 비교. |
 
 ### 참고
@@ -93,13 +102,13 @@ Temporal의 **cross-namespace / cross-service 호출 프리미티브**. 다른 T
 
 ### 주소 체계 — 3단 식별자
 
-```
-Endpoint  →  Service  →  Operation
-   │           │             │
-   └ 서버에     └ Java         └ Service 안의
-     등록된       interface      메서드 하나
-     목적지       (@Service)     (@Operation)
-     이름
+```mermaid
+flowchart LR
+    E["<b>Endpoint</b><br/>서버에 등록된<br/>목적지 이름"]
+    S["<b>Service</b><br/>Java interface<br/>@Service"]
+    O["<b>Operation</b><br/>Service 안의<br/>메서드 하나<br/>@Operation"]
+
+    E --> S --> O
 ```
 
 Spring MSA로 치면 `Endpoint`가 "서비스 주소", `Service`가 "컨트롤러", `Operation`이 "엔드포인트" 레벨에 해당. **Endpoint 이름만 서버 설정으로 분리**해두면 호출 코드는 환경(dev/stage/prod)에 종속되지 않는다.
@@ -170,9 +179,29 @@ Temporal의 "retry"는 **두 겹의 완전히 다른 메커니즘**이다:
 
 ## 개념 파악 — Worker 실행 모델과 Sticky Queue
 
-Workflow가 "어디서, 어떤 스레드에서, 어떻게 분산되어" 실행되는지의 멘탈 모델. Stub과 Worker의 역할 차이, 다른 `WORKFLOW_ID`의 독립성, Sticky Queue가 replay 비용을 어떻게 제거하는지, K8s에서 Pod/Worker 매핑과 rolling update의 상호작용까지.
+Workflow가 "어디서, 어떤 스레드에서, 어떻게 분산되어" 실행되는지의 멘탈 모델.
 
-→ 상세: [11 Worker 실행 모델과 Sticky Queue](temporal/11-worker-execution-model.md).
+### 가장 자주 묻는 질문 — "workflow 메서드는 어디서 실행되나"
+
+```java
+GreetingWorkflow workflow = client.newWorkflowStub(GreetingWorkflow.class, opts);
+WorkflowClient.start(workflow::getGreeting);   // 이 라인에서 메서드 바디는 실행되지 않음
+```
+
+- `workflow` 는 `GreetingWorkflowImpl` 인스턴스가 **아님** — SDK가 만든 **다이내믹 프록시**.
+- `start(workflow::getGreeting)` 는 메서드 레퍼런스를 가로채서 **`StartWorkflowExecution` gRPC 요청만 서버로 전송** — 서버 TaskQueue에 workflow task 투입.
+- 실제 `getGreeting(...)` **바디는 Worker 프로세스**가 `worker.registerWorkflowImplementationTypes(GreetingWorkflowImpl.class)` 로 등록해둔 클래스를 리플렉션으로 인스턴스화해서 실행.
+- 샘플 레포에선 교육상 Client와 Worker가 같은 `main()`에 공존하지만, 프로덕션에선 **Starter 프로세스 ↔ Worker 프로세스** 가 분리되는 게 일반적. TaskQueue 이름만 맞으면 서버가 중개.
+
+### Task 분산 — pull 기반 long-poll
+
+서버는 Worker 주소를 모름. Worker가 `PollWorkflowTaskQueue` / `PollActivityTaskQueue` gRPC 를 **최대 ~60초 보류 응답**으로 걸어두고, 그동안 task가 들어오면 즉시 반환. 응답 즉시 다음 poll 발사. 그래서 pull 모델인데도 지연은 push 수준.
+
+- **Normal + Sticky 두 세트** polling — 같은 Worker가 공유 TaskQueue와 자기 전용 sticky TaskQueue 양쪽에 각각 poller를 띄움.
+- **Poller 수 ≠ 동시 실행 수** — `MaxConcurrentWorkflowTaskPollers` 는 "묻는 스레드 수", `MaxConcurrentWorkflowTaskExecutionSize` 는 "실행 slot". 전자가 적어도 후자가 크면 backpressure.
+- **Sticky cache hit** 이면 full replay 생략, miss(새 worker가 받음) 면 전체 history replay 후 sticky 전환.
+
+→ 상세: [11 Worker 실행 모델과 Sticky Queue](temporal/11-worker-execution-model.md). (§4 pull 기반 분산, **§4.5 Long-poll 메커니즘 상세** — Poller vs Executor slot, Workflow/Activity Task 왕복, backpressure, keep-alive, graceful shutdown; §6 Sticky Queue 생명주기·fallback·설정)
 
 ---
 
@@ -188,5 +217,7 @@ Workflow가 "어디서, 어떤 스레드에서, 어떻게 분산되어" 실행�
 - **"gRPC 호출이 왜 자동 재시도되나 / `UNAVAILABLE` 폭주 진단 / `BackoffThrottler` 공식"** → [12 gRPC Retry](temporal/12-grpc-retry.md)
 - **"클라이언트 retry 와 서버 RetryPolicy 가 어떻게 겹치나"** → [12 gRPC Retry의 §15 비교 표](temporal/12-grpc-retry.md)
 - **"Workflow Stub과 Worker 차이 / Sticky Queue 원리 / K8s Pod=Worker"** → [11 Worker 실행 모델](temporal/11-worker-execution-model.md)
+- **"`WorkflowClient.start(workflow::메서드)` 호출했는데 실제 메서드 바디는 어디서 실행되나"** → [11 §2 Stub은 "리모컨"](temporal/11-worker-execution-model.md) + 위 "개념 파악 — Worker 실행 모델" 섹션
+- **"Worker는 서버에서 task를 어떻게 받아오나 / long-poll 기본 메커니즘 / Poller 수 vs Executor slot / backpressure / 네트워크 장비 idle timeout / shutdown과 long-poll CANCELLED"** → [11 §4.5 Long-poll 메커니즘 상세](temporal/11-worker-execution-model.md)
 - **"테스트 작성"** → [09 운영과 테스트](temporal/09-ops-and-testing.md)
 - **"코드 수정했는데 이미 돌고 있는 워크플로는?"** → [10 버저닝](temporal/10-versioning.md)

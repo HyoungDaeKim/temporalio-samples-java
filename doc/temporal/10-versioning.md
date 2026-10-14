@@ -198,15 +198,18 @@ service.blockingStub().setWorkerDeploymentCurrentVersion(req);
 
 ### 샘플의 전체 흐름 (`Starter.java`)
 
-```
-1. v1.0 Worker 뜸 → current=1.0 설정
-2. AutoUpgradingWorkflow, PinnedWorkflow 시작 → 둘 다 1.0에서 시작
-3. 두 Workflow 모두 signal 몇 번 → 1.0에서 처리됨
-4. v1.1 Worker 뜸 → current=1.1 설정
-5. 더 signal → Auto는 1.1로 자동 이동, Pinned는 1.0에 머묾
-6. v2.0 Worker 뜸 → current=2.0 설정
-7. 새 Pinned Workflow 시작 → 2.0에서 시작 (기존 Pinned는 1.0 유지)
-8. 모든 Workflow conclude
+```mermaid
+flowchart TD
+    s1["① v1.0 Worker 뜸<br/>→ current=1.0 설정"]
+    s2["② AutoUpgradingWorkflow,<br/>PinnedWorkflow 시작<br/>→ 둘 다 1.0에서 시작"]
+    s3["③ 두 Workflow 모두 signal 몇 번<br/>→ 1.0에서 처리됨"]
+    s4["④ v1.1 Worker 뜸<br/>→ current=1.1 설정"]
+    s5["⑤ 더 signal<br/>→ Auto는 1.1로 자동 이동<br/>→ Pinned는 1.0에 머묾"]
+    s6["⑥ v2.0 Worker 뜸<br/>→ current=2.0 설정"]
+    s7["⑦ 새 Pinned Workflow 시작<br/>→ 2.0에서 시작<br/>(기존 Pinned는 1.0 유지)"]
+    s8(["⑧ 모든 Workflow conclude"])
+
+    s1 --> s2 --> s3 --> s4 --> s5 --> s6 --> s7 --> s8
 ```
 → UI에서 "Pinned는 끝까지 1.0, Auto는 1.0→1.1 이동, 신규는 2.0"이 보임.
 

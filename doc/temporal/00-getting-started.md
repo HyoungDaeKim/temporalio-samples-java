@@ -91,28 +91,37 @@ temporal operator cluster health
 
 ## 1. 전체 흐름 한눈에 보기
 
-```
-ClientConfigProfile.load()                     # 환경변수/설정파일 로드
-          │
-          ▼
-WorkflowServiceStubs  ◀── WorkflowServiceStubsOptions   (gRPC 커넥션 레이어)
-          │
-          ▼
-WorkflowClient        ◀── WorkflowClientOptions         (워크플로 시작/시그널/쿼리 API)
-          │
-          ├─────────────► newWorkflowStub(...)   # 클라이언트 측: 워크플로 호출
-          │
-          ▼
-WorkerFactory         ◀── WorkerFactoryOptions          (워커 공용 설정)
-          │
-          ▼
-Worker                ◀── WorkerOptions                 (TaskQueue별 폴러/동시성)
-          │
-          ├── registerWorkflowImplementationTypes(...)
-          └── registerActivitiesImplementations(...)
-          │
-          ▼
-factory.start()                                        # 워커가 TaskQueue 폴링 시작
+```mermaid
+flowchart TD
+    config["ClientConfigProfile.load()<br/>환경변수·설정파일 로드"]
+    stubs["WorkflowServiceStubs<br/><i>gRPC 커넥션 레이어</i>"]
+    client["WorkflowClient<br/><i>워크플로 시작·시그널·쿼리 API</i>"]
+    newStub["newWorkflowStub(...)<br/><i>클라이언트 측 워크플로 호출</i>"]
+    factory["WorkerFactory<br/><i>워커 공용 설정</i>"]
+    worker["Worker<br/><i>TaskQueue별 폴러·동시성</i>"]
+    regWf["registerWorkflowImplementationTypes(...)"]
+    regAct["registerActivitiesImplementations(...)"]
+    start(["factory.start()<br/>워커가 TaskQueue 폴링 시작"])
+
+    stubsOpt(["WorkflowServiceStubsOptions"])
+    clientOpt(["WorkflowClientOptions"])
+    factoryOpt(["WorkerFactoryOptions"])
+    workerOpt(["WorkerOptions"])
+
+    config --> stubs
+    stubs --> client
+    client -. "클라이언트 측 분기" .-> newStub
+    client --> factory
+    factory --> worker
+    worker --> regWf
+    worker --> regAct
+    regWf --> start
+    regAct --> start
+
+    stubsOpt -. options .-> stubs
+    clientOpt -. options .-> client
+    factoryOpt -. options .-> factory
+    workerOpt -. options .-> worker
 ```
 
 4개 구성요소는 **아래로 갈수록 범위가 좁아진다**: Stubs(물리 커넥션) → Client(네임스페이스/직렬화) → WorkerFactory(JVM 내 모든 워커 공통) → Worker(한 TaskQueue 단위).
@@ -123,15 +132,21 @@ factory.start()                                        # 워커가 TaskQueue 폴
 
 Spring MSA에서 다른 서비스를 부를 때는 WebClient/RestClient로 HTTP를 직접 쏘지만, Temporal은 **pod 간 직접 통신이 아예 없다**. 모든 호출이 Temporal Server를 경유한다.
 
-```
-[Spring MSA]
-Service A pod ───HTTP──► Service B pod       (B가 떠있어야 함, 서비스 디스커버리 필요)
+```mermaid
+flowchart LR
+    subgraph MSA ["Spring MSA"]
+        A1["Service A pod"]
+        B1["Service B pod"]
+        A1 -- "HTTP<br/><i>B가 떠있어야 함,<br/>서비스 디스커버리 필요</i>" --> B1
+    end
 
-[Temporal]
-Service A pod ──gRPC──► Temporal Server ──TaskQueue──► Service B pod
-                            │
-                            └─ B pod이 당장 없으면 Task를 **큐에 보관**
-                               → B pod이 뜨면 polling으로 가져감
+    subgraph TEMPORAL ["Temporal"]
+        A2["Service A pod"]
+        TS["Temporal Server<br/><i>B pod 없으면<br/>Task를 큐에 보관</i>"]
+        B2["Service B pod<br/><i>polling으로<br/>가져감</i>"]
+        A2 -- gRPC --> TS
+        TS -- TaskQueue --> B2
+    end
 ```
 
 ### 개념 매핑

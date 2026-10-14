@@ -23,11 +23,17 @@ private final GreetingActivities activities =
 
 Temporal Activity는 수명 주기에서 네 타이머가 돈다. 셋 중 어느 하나는 **반드시** 설정해야 서버가 받아준다 — 일반적으로 `StartToCloseTimeout`.
 
-```
-스케줄 ──[ScheduleToStart]── 워커 수신 ──[StartToClose]── 완료
-   └──────────[ScheduleToClose: 전체 상한]──────────┘
-                              ↑
-                   [Heartbeat: 진행중 ping 간격]
+```mermaid
+flowchart LR
+    S["스케줄"]
+    R["워커 수신"]
+    C["완료"]
+    H(["Heartbeat<br/>진행중 ping 간격"])
+
+    S -- "ScheduleToStart" --> R
+    R -- "StartToClose" --> C
+    S -. "ScheduleToClose: 전체 상한" .-> C
+    H -. "ping" .-> R
 ```
 
 | 옵션 | 용도 |
@@ -56,18 +62,16 @@ cancel 신호는 **협력적(cooperative)**이다 (§14 참고). "Workflow가 sc
 
 #### 수명 주기 비교
 
-```
-                    T0 (Workflow가 scope.cancel 호출)
-                    │
-    ┌───────────────┼───────────────────────────────────┐
-    │               │                                   │
-    ▼ (TRY_CANCEL)  ▼ (WAIT_CANCELLATION_COMPLETED)     ▼ (ABANDON)
-Workflow 즉시 CanceledFailure    서버가 cancel 요청        아무 요청도 서버에
-받음. Activity는 다음 heartbeat ─── Activity가 heartbeat   보내지 않음.
-때 알게 됨 (늦게)                    에서 알아채고          Activity는 자기
-                                     cleanup 끝낼 때까지    할 일 다 하고
-                                     Workflow가 기다림      결과를 Workflow에
-                                                           돌려줌
+```mermaid
+flowchart TD
+    T0["T0: Workflow가 scope.cancel 호출"]
+    TRY["<b>TRY_CANCEL</b><br/>Workflow 즉시 CanceledFailure 받음<br/>Activity는 다음 heartbeat 때<br/>알게 됨 (늦게)"]
+    WAIT["<b>WAIT_CANCELLATION_COMPLETED</b><br/>서버가 cancel 요청<br/>Activity가 heartbeat에서 알아채고<br/>cleanup 끝낼 때까지<br/>Workflow가 기다림"]
+    ABD["<b>ABANDON</b><br/>아무 요청도 서버에 보내지 않음<br/>Activity는 자기 할 일 다 하고<br/>결과를 Workflow에 돌려줌"]
+
+    T0 --> TRY
+    T0 --> WAIT
+    T0 --> ABD
 ```
 
 #### 각 값의 동작
@@ -329,34 +333,31 @@ if (!valid(input)) {
 
 #### 재시도 중단 조건 통합 다이어그램
 
-```
-          Attempt N 실패
-                │
-                ▼
-  ┌─────────────────────────────┐
-  │ 예외가 DoNotRetry에 포함?    │ Yes → 중단 (실패 전파)
-  └─────────────────────────────┘
-                │ No
-                ▼
-  ┌─────────────────────────────┐
-  │ Non-retryable ApplicationFailure? │ Yes → 중단
-  └─────────────────────────────┘
-                │ No
-                ▼
-  ┌─────────────────────────────┐
-  │ MaximumAttempts 도달?        │ Yes → 중단 (실패 전파)
-  └─────────────────────────────┘
-                │ No
-                ▼
-  ┌─────────────────────────────┐
-  │ ScheduleToCloseTimeout 초과? │ Yes → 중단 (TimeoutFailure)
-  └─────────────────────────────┘
-                │ No
-                ▼
-       백오프 대기 (next interval)
-                │
-                ▼
-          Attempt N+1
+```mermaid
+flowchart TD
+    start["Attempt N 실패"]
+    c1{"예외가 DoNotRetry에<br/>포함?"}
+    c2{"Non-retryable<br/>ApplicationFailure?"}
+    c3{"MaximumAttempts<br/>도달?"}
+    c4{"ScheduleToCloseTimeout<br/>초과?"}
+    wait["백오프 대기<br/>(next interval)"]
+    nxt["Attempt N+1"]
+
+    stop1["중단<br/>(실패 전파)"]
+    stop2["중단"]
+    stop3["중단<br/>(실패 전파)"]
+    stop4["중단<br/>(TimeoutFailure)"]
+
+    start --> c1
+    c1 -- Yes --> stop1
+    c1 -- No --> c2
+    c2 -- Yes --> stop2
+    c2 -- No --> c3
+    c3 -- Yes --> stop3
+    c3 -- No --> c4
+    c4 -- Yes --> stop4
+    c4 -- No --> wait
+    wait --> nxt
 ```
 
 #### 타임아웃과의 상호작용 — 어느 쪽이 이기나
@@ -475,12 +476,13 @@ worker.registerWorkflowImplementationTypes(OtherWorkflowImpl.class);
 
 Activity 옵션은 세 계층에서 지정 가능하다. **더 좁은 범위가 이긴다**:
 
-```
-Workflow.newActivityStub(T.class, EXPLICIT_OPTIONS)   ← 최우선
-          ▲
-WorkflowImplementationOptions.setActivityOptions(Map)  ← 코드가 옵션 없이 stub을 만들 때
-          ▲
-WorkflowImplementationOptions.setDefaultActivityOptions(...) ← 그마저도 없을 때
+```mermaid
+flowchart BT
+    L1["WorkflowImplementationOptions.setDefaultActivityOptions(...)<br/><i>그마저도 없을 때</i>"]
+    L2["WorkflowImplementationOptions.setActivityOptions(Map)<br/><i>코드가 옵션 없이 stub을 만들 때</i>"]
+    L3["Workflow.newActivityStub(T.class, EXPLICIT_OPTIONS)<br/><b>최우선</b>"]
+
+    L1 -- "override" --> L2 -- "override" --> L3
 ```
 
 → 즉, Workflow 코드가 `Workflow.newActivityStub(T.class)`처럼 옵션을 **생략**해도, 워커 등록 시 매핑이 있으면 그 값이 적용된다. 샘플 운영 환경에서 Activity 설정을 외부(배포 설정)로 빼는 패턴.

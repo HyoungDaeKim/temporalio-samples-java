@@ -13,20 +13,27 @@ Activity의 `RetryOptions`([03 Activity 옵션](03-activity.md))가 (2) 서버 �
 
 ## 1. 핵심 클래스 구성
 
-```
-     GrpcRetryer (public facade, io.temporal.internal.retryer)
-    ┌────────────┬──────────────────────┐
-    ▼            ▼                      ▼
-  retry()  retryWithResult()  retryWithResultAsync()
-    │            │                      │
-    └──┬─────────┘                      │
-       ▼                                 ▼
-  GrpcSyncRetryer                 GrpcAsyncRetryer<R>
-   (do-while + Thread.sleep)       (ScheduledExecutor + CompletableFuture)
-       │                                 │
-       └──┬──────────────────────────────┘
-          ├─ BackoffThrottler  (지수 백오프 + jitter, congestion 분기)
-          └─ GrpcRetryerUtils  (static: 재시도 가능 여부, 종료 판정, deadline 병합)
+```mermaid
+flowchart TD
+    facade["<b>GrpcRetryer</b><br/>public facade<br/>io.temporal.internal.retryer"]
+    api1["retry()"]
+    api2["retryWithResult()"]
+    api3["retryWithResultAsync()"]
+    sync["<b>GrpcSyncRetryer</b><br/>do-while + Thread.sleep"]
+    async["<b>GrpcAsyncRetryer&lt;R&gt;</b><br/>ScheduledExecutor + CompletableFuture"]
+    throttler["<b>BackoffThrottler</b><br/>지수 백오프 + jitter<br/>congestion 분기"]
+    utils["<b>GrpcRetryerUtils</b><br/>static: 재시도 가능 여부<br/>종료 판정, deadline 병합"]
+
+    facade --> api1
+    facade --> api2
+    facade --> api3
+    api1 --> sync
+    api2 --> sync
+    api3 --> async
+    sync --> throttler
+    sync --> utils
+    async --> throttler
+    async --> utils
 ```
 
 **분리 원칙 (policy / mechanism / coordination):**
@@ -369,25 +376,32 @@ return (deadline != null && durationDeadline != null)
 
 ## 8. 호출 관계 (요약 시퀀스)
 
-```
-GrpcSyncRetryer.retry()
-  │
-  ├─ GrpcRetryerUtils.mergeDurationWithAnAbsoluteDeadline() → 시퀀스 Deadline
-  ├─ new BackoffThrottler(...)
-  │
-  └─ do {
-       ├─ throttler.getSleepTime() → sleep
-       ├─ r.apply()                            ─┐
-       │   ├ 성공: throttler.success() → return │
-       │   └ 실패:                              │
-       │     ├─ GrpcRetryerUtils.createFinalExceptionIfNotRetryable()
-       │     │   ├ 영구: throw
-       │     │   └ 가능:
-       │     │     ├─ GrpcRetryerUtils.lastMeaningfulException() 갱신
-       │     │     └─ throttler.failure(code)
-       │     └─ (loop condition)
-       └─ GrpcRetryerUtils.ranOutOfRetries() → true면 탈출 → rethrow(lastMeaningfulException)
-     } while (!ranOutOfRetries)
+```mermaid
+flowchart TD
+    start(["GrpcSyncRetryer.retry()"])
+    init1["GrpcRetryerUtils.mergeDurationWithAnAbsoluteDeadline()<br/>→ 시퀀스 Deadline"]
+    init2["new BackoffThrottler(...)"]
+    sleep["throttler.getSleepTime() → sleep"]
+    apply["r.apply()"]
+    ok{성공?}
+    success["throttler.success()<br/>→ return"]
+    judge["GrpcRetryerUtils.<br/>createFinalExceptionIfNotRetryable()"]
+    perm{영구?}
+    throwFinal(["throw"])
+    lastExc["GrpcRetryerUtils.lastMeaningfulException()<br/>갱신"]
+    fail["throttler.failure(code)"]
+    loopCond{"GrpcRetryerUtils.ranOutOfRetries()?"}
+    rethrow(["rethrow(lastMeaningfulException)"])
+
+    start --> init1 --> init2 --> sleep
+    sleep --> apply --> ok
+    ok -- 성공 --> success
+    ok -- 실패 --> judge
+    judge --> perm
+    perm -- 영구 --> throwFinal
+    perm -- 가능 --> lastExc --> fail --> loopCond
+    loopCond -- "false (계속)" --> sleep
+    loopCond -- "true (탈출)" --> rethrow
 ```
 
 ---
@@ -617,13 +631,14 @@ onClose(Status status, ...) {
 
 지금까지는 **전송 계층(gRPC)**. 서버 측에는 전혀 다른 메커니즘이 존재:
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│ 1. Activity retry      (RetryPolicy 기반, 가장 중요)         │
-│ 2. Workflow task retry (서버 내부 고정 백오프, 자동)          │
-│ 3. Workflow retry      (RetryPolicy 기반, 톱레벨 재시작)      │
-│ 4. 서버 perimeter 레벨 (RESOURCE_EXHAUSTED, 토큰 버킷)        │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    subgraph server["서버 측 재시도 메커니즘"]
+        r1["① Activity retry<br/>RetryPolicy 기반, 가장 중요"]
+        r2["② Workflow task retry<br/>서버 내부 고정 백오프, 자동"]
+        r3["③ Workflow retry<br/>RetryPolicy 기반, 톱레벨 재시작"]
+        r4["④ 서버 perimeter 레벨<br/>RESOURCE_EXHAUSTED, 토큰 버킷"]
+    end
 ```
 
 ### 14-1. Activity Retry — 가장 큰 그림
@@ -649,18 +664,18 @@ message RetryPolicy {
 
 **서버 측 흐름:**
 
-```
-1. 워커가 Activity 실행 → ApplicationFailure 던짐
-2. 워커 → Temporal 서버: RespondActivityTaskFailed(failure)
-3. 서버 (History 서비스):
-     a. failure.type ∈ non_retryable_error_types ?      → ❌ 포기
-     b. attempt >= maximum_attempts ?                   → ❌ 포기
-     c. ScheduleToCloseTimeout 지났나?                  → ❌ 포기
-     d. 다음 재시도 시각 계산 → ScheduleToClose 초과?    → ❌ 포기
-     e. 서버 내부 타이머에 "nextInterval 후 다시 매칭 큐로" 등록
-4. (nextInterval 경과)
-5. 서버가 Matching 서비스 큐에 재투입
-6. 워커가 폴링해서 받아감 → attempt++
+```mermaid
+sequenceDiagram
+    participant W as Worker
+    participant H as Server (History)
+    participant M as Server (Matching Queue)
+
+    Note over W: ① Activity 실행<br/>→ ApplicationFailure 던짐
+    W->>H: ② RespondActivityTaskFailed(failure)
+    Note over H: ③ 재시도 판정<br/>a. failure.type ∈ non_retryable_error_types? → ❌ 포기<br/>b. attempt >= maximum_attempts? → ❌ 포기<br/>c. ScheduleToCloseTimeout 지났나? → ❌ 포기<br/>d. 다음 재시도 시각 → ScheduleToClose 초과? → ❌ 포기<br/>e. 서버 내부 타이머 등록<br/>   ("nextInterval 후 다시 매칭 큐로")
+    Note over H: ④ nextInterval 경과
+    H->>M: ⑤ Matching 서비스 큐에 재투입
+    M-->>W: ⑥ 워커가 폴링해서 받아감<br/>→ attempt++
 ```
 
 **핵심 특성:**

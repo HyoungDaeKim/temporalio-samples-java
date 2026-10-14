@@ -292,26 +292,18 @@ Workflow 입출력, Activity 입출력, Signal/Query/Update 인자 등 **모든 
 
 ### 3계층 구조
 
-```
-Workflow/Activity 코드 (Java Object)
-         │
-         ▼
-┌─────────────────────────────┐
-│   DataConverter (최상위)    │  매 호출마다 사용되는 진입점. 보통 CodecDataConverter.
-└─────────────────────────────┘
-         │
-         ▼
-┌─────────────────────────────┐
-│   PayloadConverter (직렬화) │  Object ↔ Payload (JSON, protobuf, CloudEvents 등)
-└─────────────────────────────┘
-         │
-         ▼                                 Payload (JSON bytes)
-┌─────────────────────────────┐
-│   PayloadCodec (변환)       │  Payload → Payload (암호화, 압축, 서명)
-└─────────────────────────────┘
-         │
-         ▼
-    Temporal Server (전부 byte array로만 저장)
+```mermaid
+flowchart TD
+    code["Workflow/Activity 코드<br/>(Java Object)"]
+    dc["<b>DataConverter</b> (최상위)<br/><i>매 호출마다 사용되는 진입점<br/>보통 CodecDataConverter</i>"]
+    pc["<b>PayloadConverter</b> (직렬화)<br/><i>Object ↔ Payload<br/>(JSON, protobuf, CloudEvents 등)</i>"]
+    codec["<b>PayloadCodec</b> (변환)<br/><i>Payload → Payload<br/>(암호화, 압축, 서명)</i>"]
+    server[("Temporal Server<br/>(전부 byte array로만 저장)")]
+
+    code --> dc
+    dc --> pc
+    pc -- "Payload (JSON bytes)" --> codec
+    codec --> server
 ```
 
 ### `DataConverter` — 조립 지점 (`core/.../encodefailures/EncodeFailuresTest.java`)
