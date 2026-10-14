@@ -72,6 +72,13 @@ factory.start()                                        # 워커가 TaskQueue 폴
 | 09 | [운영과 테스트](temporal/09-ops-and-testing.md) | `Schedule`(Cron 상위 호환 주기 실행), `Replay`로 결정성 검증, `TestWorkflowRule`/`TestWorkflowEnvironment`/`TestWorkflowExtension` 서버 없이 테스트. |
 | 10 | [버저닝](temporal/10-versioning.md) | `Workflow.getVersion` 코드 레벨 Patching, Worker Versioning(Deployment)로 서버가 관리하는 배포 버전. |
 
+### SDK 내부와 실행 모델
+
+| # | 파일 | 다루는 내용 |
+| --- | --- | --- |
+| 11 | [Worker 실행 모델과 Sticky Queue](temporal/11-worker-execution-model.md) | `Workflow.await()` vs `while` 루프, Stub과 Worker의 역할 차이, 다른 `WORKFLOW_ID`의 독립성, pull 기반 task 분산, K8s에서 Pod=Worker 매핑, Sticky Queue 생명주기·fallback·설정값·관찰 지표. |
+| 12 | [gRPC Retry (전송 계층 재시도)](temporal/12-grpc-retry.md) | `GrpcRetryer` facade와 Sync/Async 구현, `BackoffThrottler` 공식과 congestion 분기, `GrpcRetryerUtils` 재시도 정책 결정기, `RpcRetryOptions` 기본값, 실제 호출 지점(`GenericWorkflowClientImpl` 등), `GrpcMetricsInterceptor` 자동 계측, 서버 측 `RetryPolicy`와의 비교. |
+
 ### 참고
 
 | # | 파일 | 다루는 내용 |
@@ -150,6 +157,25 @@ worker.registerWorkflowImplementationTypes(
 
 ---
 
+## 개념 파악 — gRPC Retry (전송 계층 재시도)
+
+Temporal의 "retry"는 **두 겹의 완전히 다른 메커니즘**이다:
+
+1. **클라이언트 gRPC 재시도** (`GrpcRetryer`) — 네트워크/서버 혼잡 흡수. 짧고 메모리에 상주, 프로세스 종료 시 유실.
+2. **서버 측 RetryPolicy** — Activity/Workflow 실패를 지속성 있게 재실행. 길고 영속, 워커 재시작에도 생존.
+
+→ 상세: [12 gRPC Retry (전송 계층 재시도)](temporal/12-grpc-retry.md). `GrpcRetryer` facade·Sync/Async 구현, `BackoffThrottler` 공식, 재시도 정책 테이블, `RpcRetryOptions` 디폴트, `GrpcMetricsInterceptor` 자동 계측, 클라이언트 vs 서버 재시도 비교까지.
+
+---
+
+## 개념 파악 — Worker 실행 모델과 Sticky Queue
+
+Workflow가 "어디서, 어떤 스레드에서, 어떻게 분산되어" 실행되는지의 멘탈 모델. Stub과 Worker의 역할 차이, 다른 `WORKFLOW_ID`의 독립성, Sticky Queue가 replay 비용을 어떻게 제거하는지, K8s에서 Pod/Worker 매핑과 rolling update의 상호작용까지.
+
+→ 상세: [11 Worker 실행 모델과 Sticky Queue](temporal/11-worker-execution-model.md).
+
+---
+
 ## 자주 가는 길
 
 - **"Temporal을 처음 본다"** → [00](temporal/00-getting-started.md) → [01](temporal/01-setup.md) → [02](temporal/02-workflow-options.md) → [03](temporal/03-activity.md)
@@ -159,5 +185,8 @@ worker.registerWorkflowImplementationTypes(
 - **"다른 서비스의 Workflow를 호출하고 싶다"** → [04 조합](temporal/04-composition.md)의 ChildWorkflow + 다른 TaskQueue, 또는 Nexus
 - **"Nexus 개념 요약"** → 위 "개념 파악 — Nexus" 섹션 (상세는 [04 조합](temporal/04-composition.md)의 §13)
 - **"Activity 재시도/타임아웃 조정"** → [03 Activity 옵션](temporal/03-activity.md)
+- **"gRPC 호출이 왜 자동 재시도되나 / `UNAVAILABLE` 폭주 진단 / `BackoffThrottler` 공식"** → [12 gRPC Retry](temporal/12-grpc-retry.md)
+- **"클라이언트 retry 와 서버 RetryPolicy 가 어떻게 겹치나"** → [12 gRPC Retry의 §15 비교 표](temporal/12-grpc-retry.md)
+- **"Workflow Stub과 Worker 차이 / Sticky Queue 원리 / K8s Pod=Worker"** → [11 Worker 실행 모델](temporal/11-worker-execution-model.md)
 - **"테스트 작성"** → [09 운영과 테스트](temporal/09-ops-and-testing.md)
 - **"코드 수정했는데 이미 돌고 있는 워크플로는?"** → [10 버저닝](temporal/10-versioning.md)
