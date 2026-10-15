@@ -52,6 +52,7 @@
 - `setParallelCompensation(true)` 병렬 보상: `core/src/main/java/io/temporal/samples/bookingsaga/TripBookingWorkflowImpl.java`
 - 기본값(순차 보상): `core/src/main/java/io/temporal/samples/bookingsyncsaga/TripBookingWorkflowImpl.java`
 - 순차 보상 + 자식 워크플로 보상: `core/src/main/java/io/temporal/samples/hello/HelloSaga.java`
+- Nested Saga (자식 레그마다 Saga + 부모가 undo 워크플로 조립): `core/src/main/java/io/temporal/samples/nestedsaga/NestedSaga.java`, 테스트 `core/src/test/java/io/temporal/samples/nestedsaga/NestedSagaTest.java`
 
 **ChildWorkflowOptions**
 - 비동기 자식 + `ParentClosePolicy.ABANDON`: `core/src/main/java/io/temporal/samples/asyncchild/ParentWorkflowImpl.java`, `core/src/main/java/io/temporal/samples/asyncuntypedchild/ParentWorkflowImpl.java`
@@ -68,7 +69,7 @@
 - 레이싱(Activity): `core/src/main/java/io/temporal/samples/hello/HelloCancellationScope.java`
 - 레이싱(Nexus): `core/src/main/java/io/temporal/samples/nexuscancellation/caller/HelloCallerWorkflowImpl.java`
 - Timer로 Activity timeout 구현: `core/src/main/java/io/temporal/samples/hello/HelloCancellationScopeWithTimer.java`
-- detached scope (보상 보호): `core/src/main/java/io/temporal/samples/bookingsyncsaga/TripBookingWorkflowImpl.java`, `core/src/main/java/io/temporal/samples/bookingsaga/TripBookingWorkflowImpl.java`, `core/src/main/java/io/temporal/samples/hello/HelloDetachedCancellationScope.java`
+- detached scope (보상 보호): `core/src/main/java/io/temporal/samples/bookingsyncsaga/TripBookingWorkflowImpl.java`, `core/src/main/java/io/temporal/samples/bookingsaga/TripBookingWorkflowImpl.java`, `core/src/main/java/io/temporal/samples/hello/HelloDetachedCancellationScope.java`, `core/src/main/java/io/temporal/samples/nestedsaga/NestedSaga.java` (nested saga의 모든 catch에서)
 - Signal로 scope.cancel: `core/src/test/java/io/temporal/samples/hello/HelloUpdateAndCancellationTest.java`
 - Nexus handler 측 scope: `core/src/main/java/io/temporal/samples/nexuscancellation/handler/HelloHandlerWorkflowImpl.java`
 

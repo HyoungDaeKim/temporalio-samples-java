@@ -62,7 +62,7 @@ impl 쪽을 보면 `public void exit() { this.exit = true; }`처럼 평범한 Ja
 sequenceDiagram
     participant C as Client JVM
     participant S as Temporal Server
-    participant W as Worker JVM<br/>(워크플로 실행 중)
+    participant W as Worker JVM (워크플로 실행 중)
 
     Note over C: workflowById.exit() 호출<br/>workflowById는 impl이 아니라<br/>client.newWorkflowStub(...)이 리턴한<br/>JDK Dynamic Proxy<br/>(GreetingWorkflow 인터페이스)
     Note over C: 프록시가 호출을 가로채<br/>인터페이스의 @SignalMethod<br/>애너테이션을 보고<br/>"Signal RPC로 보내라"고 판단
@@ -74,7 +74,7 @@ sequenceDiagram
     S-->>W: WorkflowTask 전달
 
     Note over W: 리플레이 중 Signal 이벤트에 도달<br/>→ GreetingWorkflowImpl.exit() 실행<br/>  (workflow 컨텍스트 안에서)<br/>  → this.exit = true
-    Note over W: Workflow.await(() -&gt; ... || exit)<br/>조건 재평가 → true<br/>→ 깨어나서 return
+    Note over W: Workflow.await 안의 람다 재평가<br/>exit=true 이므로 조건 성립<br/>깨어나서 return
 ```
 
 즉 `workflowById.exit()`은 네트워크를 왕복해 **서버가 보관한 워크플로 상태 위에서** impl의 `exit()`을 실행시킨다. 겉으로는 메서드 호출이지만 바이트코드로는 `프록시 → gRPC → 서버 → Worker → impl` 경로를 탄다.
@@ -425,7 +425,7 @@ flowchart TD
     q1 -- No --> sig
     q1 -- Yes --> q2
     q2 -- Yes --> qry
-    q2 -- No<br/>(상태 변경 포함) --> q3
+    q2 -->|"No<br/>(상태 변경 포함)"| q3
     q3 -- Yes --> upd
     q3 -- No --> combo
 ```

@@ -13,3 +13,4 @@ target
 bin/
 core/.vscode/
 .claude/
+/temporal_cli_1.9.1/

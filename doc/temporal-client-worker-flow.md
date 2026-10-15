@@ -65,6 +65,8 @@ flowchart TD
 | --- | --- | --- |
 | 04 | [Workflow 조합](temporal/04-composition.md) | `Saga.Options` 보상 트랜잭션, `ChildWorkflowOptions`(`ParentClosePolicy`·`ChildWorkflowCancellationType` 심화), Nexus 서비스 호출(`NexusServiceOptions`/`NexusOperationOptions`, 크로스 namespace RPC). |
 | 05 | [동시성](temporal/05-concurrency.md) | `CancellationScope`로 async 작업 묶음 취소, `Async`로 Workflow 안에서 비동기 호출, `Promise`/`CompletablePromise` 핸들링. |
+| 13 | [Nexus 개요](temporal/13-nexus-overview.md) | **서비스 간 호출 프리미티브**의 전체 그림. 3단 주소 체계(Endpoint/Service/Operation), 호출 두 지점(Workflow 코드 vs Worker 등록), ChildWorkflow·일반 호출과의 결정표, 이점·핵심 옵션. 04 §13의 상세 옵션으로 들어가기 전 멘탈 모델. |
+| 15 | [Saga 보상 패턴과 Nested Saga](temporal/15-nested-saga.md) | `catch` 안의 `compensate()`가 외부 cancel에 유실되는 함정(detached scope), **자식 워크플로마다 자기 Saga를 가지는 Nested Saga** 패턴(mermaid 다이어그램 + 두 가지 실패 경로 + 설계 원칙 + 체크리스트), `NestedSaga.java` 샘플 레퍼런스. |
 
 ### 메시징과 시간
 
@@ -86,94 +88,14 @@ flowchart TD
 | # | 파일 | 다루는 내용 |
 | --- | --- | --- |
 | 11 | [Worker 실행 모델과 Sticky Queue](temporal/11-worker-execution-model.md) | `Workflow.await()` vs `while` 루프, **Stub은 "리모컨"일 뿐 — 실제 workflow 메서드 바디는 Worker가 실행**, 다른 `WORKFLOW_ID`의 독립성, **pull 기반 long-poll task 분산** (Normal+Sticky 두 세트 polling), K8s에서 Pod=Worker 매핑, Sticky Queue 생명주기·fallback·설정값·관찰 지표. |
-| 12 | [gRPC Retry (전송 계층 재시도)](temporal/12-grpc-retry.md) | `GrpcRetryer` facade와 Sync/Async 구현, `BackoffThrottler` 공식과 congestion 분기, `GrpcRetryerUtils` 재시도 정책 결정기, `RpcRetryOptions` 기본값, 실제 호출 지점(`GenericWorkflowClientImpl` 등), `GrpcMetricsInterceptor` 자동 계측, 서버 측 `RetryPolicy`와의 비교. |
+| 12 | [gRPC Retry (전송 계층 재시도)](temporal/12-grpc-retry.md) | `GrpcRetryer` facade와 Sync/Async 구현, `BackoffThrottler` 공식과 congestion 분기, `GrpcRetryerUtils` 재시도 정책 결정기, `RpcRetryOptions` 기본값, 실제 호출 지점(`GenericWorkflowClientImpl` 등), `GrpcMetricsInterceptor` 자동 계측, 서버 측 `RetryPolicy`와의 비교. **두 겹 메커니즘**(클라이언트 gRPC retry vs 서버 RetryPolicy)의 요약 포함. |
+| 14 | [SDK 내부 상태머신 (`WorkflowStateMachines`)](temporal/14-state-machines.md) | WFT 수신 → History Event → Command 변환의 전체 파이프라인(mermaid), `HelloActivity` history로 보는 처리 순서, `WorkflowTaskStateMachine` / `ActivityStateMachine`(12 상태, Cancel 3경합) / `TimerStateMachine`(7 상태) 상태 전이 다이어그램, `ActivityCancellationType` 3종의 통지 시점 매핑, replay 결정론 검증 지점. |
 
 ### 참고
 
 | # | 파일 | 다루는 내용 |
 | --- | --- | --- |
 | 99 | [체크리스트 & 샘플 레퍼런스](temporal/99-checklist.md) | 셋업 완료 전 확인할 체크리스트, 주요 샘플 파일 경로 모음. |
-
----
-
-## 개념 파악 — Nexus (서비스 간 호출의 표준 방식)
-
-Temporal의 **cross-namespace / cross-service 호출 프리미티브**. 다른 Temporal 서비스(또는 다른 cluster)의 Workflow/Activity를 **네트워크 안전하게 Workflow처럼** 호출하도록 만든 공식 추상화 — Spring MSA의 WebClient/RestClient에 가장 가까운 "서비스 간 RPC" 역할을 한다.
-
-### 주소 체계 — 3단 식별자
-
-```mermaid
-flowchart LR
-    E["<b>Endpoint</b><br/>서버에 등록된<br/>목적지 이름"]
-    S["<b>Service</b><br/>Java interface<br/>@Service"]
-    O["<b>Operation</b><br/>Service 안의<br/>메서드 하나<br/>@Operation"]
-
-    E --> S --> O
-```
-
-Spring MSA로 치면 `Endpoint`가 "서비스 주소", `Service`가 "컨트롤러", `Operation`이 "엔드포인트" 레벨에 해당. **Endpoint 이름만 서버 설정으로 분리**해두면 호출 코드는 환경(dev/stage/prod)에 종속되지 않는다.
-
-### 호출의 두 지점
-
-```java
-// 1) Workflow 코드 안 — 호출 시마다
-SampleNexusService svc = Workflow.newNexusServiceStub(
-    SampleNexusService.class,
-    NexusServiceOptions.newBuilder()
-        .setOperationOptions(NexusOperationOptions.newBuilder()
-            .setScheduleToCloseTimeout(Duration.ofSeconds(10))
-            .build())
-        .build());
-HelloOutput out = svc.hello(input);
-
-// 2) Worker 등록 시 — 환경별 endpoint 주입 (운영/테스트에서 바꿔치기)
-worker.registerWorkflowImplementationTypes(
-    WorkflowImplementationOptions.newBuilder()
-        .setNexusServiceOptions(Map.of(
-            "SampleNexusService",
-            NexusServiceOptions.newBuilder().setEndpoint("prod-nexus").build()))
-        .build(),
-    HelloCallerWorkflowImpl.class);
-```
-
-### 언제 Nexus인가 — 다른 방식과 비교
-
-| 상황 | 추천 |
-| --- | --- |
-| 같은 namespace / 같은 팀의 서브 플로우 분해 | **ChildWorkflow** (같은 코드 베이스, 가벼움) |
-| 같은 서비스 안에서 Activity만 다른 Worker 풀에 분산 | **Activity + TaskQueue 분리** |
-| **다른 namespace / 다른 팀의 서비스를 Workflow에서 호출** | **Nexus** ← 여기 |
-| 외부 애플리케이션이 Workflow를 **시작**만 하면 됨 (서비스 간 호출 아님) | `WorkflowClient.start(...)` (일반 Starter) |
-
-### Nexus의 이점 (ChildWorkflow·일반 호출 대비)
-
-1. **서비스 경계가 명확** — 호출 측은 provider의 코드/jar를 몰라도 됨. interface만 공유하면 끝. REST 스펙 공유와 같은 느낌.
-2. **환경별 endpoint 교체가 운영 영역** — 호출 코드 수정 없이 테스트에선 `test-endpoint`, 운영에선 `prod-endpoint`로 swap (`core/.../nexus/caller/CallerWorkflowTest.java`).
-3. **cross-cluster 지원** — 다른 Temporal cluster로도 호출 가능. 글로벌 서비스 메시 성격.
-4. **Workflow 안에서 호출** — 재시도/타임아웃/취소 전파가 Workflow 결정성 모델 안에서 그대로 동작. Signal/Query/Update와 궁합이 좋음.
-
-### 핵심 옵션
-
-- **`NexusServiceOptions`** — 서비스 전체 수준 (`setEndpoint`, 공통 `setOperationOptions`, operation별 `setOperationMethodOptions`)
-- **`NexusOperationOptions`** — operation 호출 수준 (`setScheduleToCloseTimeout`, `setCancellationType`)
-- **`NexusOperationCancellationType`** — 4가지 (ABANDON / TRY_CANCEL / WAIT_REQUESTED / WAIT_COMPLETED). 상세는 [04 조합](temporal/04-composition.md#nexusoperationcancellationtype-심화--4가지-동작의-상세-차이) 참고.
-
-### 깊이 파고들기
-
-- [04 조합: §13 Nexus 섹션](temporal/04-composition.md) — 옵션 전체, Cancellation 4가지 심화, ChildWorkflow와의 상세 비교
-- [00 시작하기: MSA 매핑](temporal/00-getting-started.md#1-a-msa-호출과의-매핑--spring-webclientrestclient와-비교) — Spring 호출 모델과 Temporal 호출 모델의 전반적 매핑
-- 샘플: `core/src/main/java/io/temporal/samples/nexuscancellation/`, `core/src/main/java/io/temporal/samples/nexusmultipleargs/`, `core/src/main/java/io/temporal/samples/nexusmessaging/`
-
----
-
-## 개념 파악 — gRPC Retry (전송 계층 재시도)
-
-Temporal의 "retry"는 **두 겹의 완전히 다른 메커니즘**이다:
-
-1. **클라이언트 gRPC 재시도** (`GrpcRetryer`) — 네트워크/서버 혼잡 흡수. 짧고 메모리에 상주, 프로세스 종료 시 유실.
-2. **서버 측 RetryPolicy** — Activity/Workflow 실패를 지속성 있게 재실행. 길고 영속, 워커 재시작에도 생존.
-
-→ 상세: [12 gRPC Retry (전송 계층 재시도)](temporal/12-grpc-retry.md). `GrpcRetryer` facade·Sync/Async 구현, `BackoffThrottler` 공식, 재시도 정책 테이블, `RpcRetryOptions` 디폴트, `GrpcMetricsInterceptor` 자동 계측, 클라이언트 vs 서버 재시도 비교까지.
 
 ---
 
@@ -212,7 +134,7 @@ WorkflowClient.start(workflow::getGreeting);   // 이 라인에서 메서드 바
 - **"워크플로가 시작은 됐는데 폴링이 안 된다"** → [99 체크리스트](temporal/99-checklist.md)
 - **"Signal이 뭔지 원리부터 알고 싶다"** → [06 메시징](temporal/06-messaging.md)의 Signal 섹션 (`@SignalMethod` 호출 메커니즘 포함)
 - **"다른 서비스의 Workflow를 호출하고 싶다"** → [04 조합](temporal/04-composition.md)의 ChildWorkflow + 다른 TaskQueue, 또는 Nexus
-- **"Nexus 개념 요약"** → 위 "개념 파악 — Nexus" 섹션 (상세는 [04 조합](temporal/04-composition.md)의 §13)
+- **"Nexus 개념 요약"** → [13 Nexus 개요](temporal/13-nexus-overview.md) (상세는 [04 조합](temporal/04-composition.md)의 §13)
 - **"Activity 재시도/타임아웃 조정"** → [03 Activity 옵션](temporal/03-activity.md)
 - **"gRPC 호출이 왜 자동 재시도되나 / `UNAVAILABLE` 폭주 진단 / `BackoffThrottler` 공식"** → [12 gRPC Retry](temporal/12-grpc-retry.md)
 - **"클라이언트 retry 와 서버 RetryPolicy 가 어떻게 겹치나"** → [12 gRPC Retry의 §15 비교 표](temporal/12-grpc-retry.md)
@@ -221,3 +143,8 @@ WorkflowClient.start(workflow::getGreeting);   // 이 라인에서 메서드 바
 - **"Worker는 서버에서 task를 어떻게 받아오나 / long-poll 기본 메커니즘 / Poller 수 vs Executor slot / backpressure / 네트워크 장비 idle timeout / shutdown과 long-poll CANCELLED"** → [11 §4.5 Long-poll 메커니즘 상세](temporal/11-worker-execution-model.md)
 - **"테스트 작성"** → [09 운영과 테스트](temporal/09-ops-and-testing.md)
 - **"코드 수정했는데 이미 돌고 있는 워크플로는?"** → [10 버저닝](temporal/10-versioning.md)
+- **"Saga 보상이 외부 cancel에 휩쓸려 유실되는 걸 막고 싶다"** → [15 Saga 보상 패턴과 Nested Saga §1](temporal/15-nested-saga.md) (detached scope 패턴)
+- **"자식 워크플로마다 자기 Saga가 필요한 경우 / 자식 성공 후 부모 단계가 실패하면 어떻게 되돌리나"** → [15 Saga 보상 패턴과 Nested Saga §2](temporal/15-nested-saga.md) + `core/src/main/java/io/temporal/samples/nestedsaga/NestedSaga.java`
+- **"서버 history event 가 Command 로 변환되는 내부 과정 / replay 결정론 검증은 어디서 터지나"** → [14 SDK 내부 상태머신 (`WorkflowStateMachines`)](temporal/14-state-machines.md)
+- **"`WorkflowTaskStateMachine` / `ActivityStateMachine` / `TimerStateMachine` 상태 전이 / Cancel 경합 처리"** → [14 SDK 내부 상태머신](temporal/14-state-machines.md)의 각 다이어그램
+- **"Timer cancel 하면 서버 확정을 기다리나? / `Workflow.sleep` cancel 시 Promise 는 언제 깨나"** → [14 TimerStateMachine 섹션](temporal/14-state-machines.md#timerstatemachine--가장-단순한-비동기-primitive) (즉시 통지)
