@@ -34,9 +34,27 @@ flowchart TD
     nonStateful --> takeCommands
 ```
 
-## 샘플 History 로 보는 처리 순서
+## 샘플 1 — `HelloActivity` 전체 추적
 
-`HelloActivity` 처럼 **Activity 1회 → 완료** 하는 가장 단순한 workflow의 history는 아래 형태:
+리포의 [`HelloActivity.java`](../../core/src/main/java/io/temporal/samples/hello/HelloActivity.java) 를 끝까지 따라가 본다. **Activity 1회 → 완료** 하는 가장 단순한 workflow 라 전체 파이프라인이 다 보인다.
+
+### 사용자 코드
+
+```java
+public static class GreetingWorkflowImpl implements GreetingWorkflow {
+  private final GreetingActivities activities =
+      Workflow.newActivityStub(
+          GreetingActivities.class,
+          ActivityOptions.newBuilder().setStartToCloseTimeout(Duration.ofSeconds(2)).build());
+
+  @Override
+  public String getGreeting(String name) {
+    return activities.composeGreeting("Hello", name);   // ★ 이 한 줄이 모든 걸 트리거
+  }
+}
+```
+
+### 서버 history 가 쌓이는 모양
 
 ```
 #1  WorkflowExecutionStarted
@@ -52,21 +70,37 @@ flowchart TD
 #11 WorkflowExecutionCompleted (command event)
 ```
 
-**첫 번째 WFT (`#1~#3` 수신)**:
+이 history 는 **두 번의 WFT** 로 나뉘어 worker 에 전달된다. WFT1 은 `#1~#3`, WFT2 는 `#4~#9` (`#10~#11` 은 WFT2 처리 결과로 서버에 저장되는 미래 이벤트).
 
-- `#1 WorkflowExecutionStarted` → `handleNonStatefulEvent` → `callbacks.start(event)` 로 **사용자 workflow 메서드가 처음 실행**. `activity.greet(...)` 호출이 `cancellableCommands` 큐에 `ScheduleActivityTask` command 를 push, Promise `.get()` 에서 blocked.
-- `#2 WorkflowTaskScheduled` → `WorkflowTaskStateMachine` 생성, `stateMachines.put(2, sm)`.
-- `#3 WorkflowTaskStarted` → `stateMachines.get(2)` 로 라우팅 → `prepareCommands()` → `cancellableCommands → commands` 로 이동.
-- Worker가 `takeCommands()` → `ScheduleActivityTask` 1개를 서버로 전송.
+### WFT1 — 사용자 코드가 처음 실행되는 순간
 
-**두 번째 WFT (`#4~#9` 수신, 일부는 replay)**:
+| 순서 | 사용자 코드 / SDK 내부 동작 | State machine 변화 | 큐 상태 |
+| --- | --- | --- | --- |
+| ① history `#1` 수신 | `handleNonStatefulEvent(WorkflowExecutionStarted)` → `callbacks.start(event)` → **`getGreeting("World")` 메서드 호출** | — | `cancellableCommands`: `[]` |
+| ② 사용자 코드 `activities.composeGreeting(...)` | `scheduleActivityTask()` → `ActivityStateMachine.newInstance()` → `SCHEDULE` 투입 | `CREATED → SCC` | `cancellableCommands`: `[ScheduleActivityTask(greet-1)]` |
+| ③ Promise `.get()` 에서 block | workflow thread 양보 | — | — |
+| ④ history `#2` 수신 | `WorkflowTaskStateMachine` 신규 생성, `stateMachines.put(2, sm)` | WFT SM: `CREATED → SCHEDULED` | — |
+| ⑤ history `#3` 수신 (= WFT 끝) | `stateMachines.get(2)` 라우팅 → `handleStarted()` | WFT SM: `SCHEDULED → STARTED` → (lookahead `handleCompleted()`) | — |
+| ⑥ `prepareCommands()` 호출 | 큐에 쌓인 command 를 외부 반출용 큐로 이동 | `SCC → SCC` (self, `addCommand()` 훅) | `cancellableCommands → commands`: `[ScheduleActivityTask]` |
+| ⑦ worker `takeCommands()` | 서버로 응답 전송 | — | 비워짐 |
 
-- `#5 ActivityTaskScheduled` 는 **command event** → `handleCommandEvent`:
-  - `commands.peek()` 에서 이전 WFT가 보낸 `ScheduleActivityTask` command 를 꺼내 매칭.
-  - `validateCommand()` 로 activityId / activityType / taskQueue 비교 — 불일치 시 **`NonDeterministicException`**.
-  - 매칭된 `ActivityStateMachine` 을 `stateMachines.put(5, sm)` 로 등록.
-- `#6 ActivityTaskStarted`, `#7 ActivityTaskCompleted` → 모두 `scheduledEventId=5` 로 라우팅되어 같은 SM 에 전달. `#7` 에서 `completionCallback` 으로 Promise complete.
-- `#9 WorkflowTaskStarted` 처리 시 `eventLoop()` 가 돌면서 사용자 코드가 깨어나 다음 command(`CompleteWorkflowExecution`)를 발행.
+**핵심**: 사용자가 `activities.composeGreeting(...)` 을 호출한 그 순간엔 서버 통신이 전혀 없다. command 는 workflow 메모리의 `cancellableCommands` 큐에만 있고, WFT 가 끝날 때 batch 로 서버에 보내진다.
+
+### WFT2 — Activity 완료 후, workflow 완결까지
+
+history `#4~#9` 가 한 batch 로 들어온다. `#4~#5` 는 WFT1 결과가 서버에 기록된 "자기 자신의 과거" (replay 영역), `#6~#9` 가 신규 이벤트.
+
+| 순서 | 수신 event | WorkflowStateMachines 동작 | ActivityStateMachine 상태 |
+| --- | --- | --- | --- |
+| ① `#4 WorkflowTaskCompleted` | WFT SM(id=2) 종결, `stateMachines.remove(2)` | — |
+| ② `#5 ActivityTaskScheduled` ★ command event | `handleCommandEvent` → `commands.peek()` 로 WFT1 의 `ScheduleActivityTask` 꺼내 매칭 → `validateCommand()` (activityId / type / taskQueue 비교) → `ActivityStateMachine` 을 `stateMachines.put(5, sm)` | `SCC → SER` |
+| ③ `#6 ActivityTaskStarted` | `stateMachines.get(5).handleEvent(...)` | `SER → STARTED` |
+| ④ `#7 ActivityTaskCompleted` | 동일 라우팅. `completionCallback` 으로 Promise complete → **blocked 되어 있던 workflow thread 재개 준비** | `STARTED → COMPLETED` (final → `stateMachines.remove(5)`) |
+| ⑤ `#8 WorkflowTaskScheduled` | 새 WFT SM(id=8) 생성 | — |
+| ⑥ `#9 WorkflowTaskStarted` (= WFT 끝) | WFT SM(id=8) → `handleStarted()` 안에서 `eventLoop()` 실행 → workflow thread 가 깨어나 `activities.composeGreeting` 리턴값을 받고 **메서드 종료** → `completeWorkflowExecution()` command push | 해당 SM 은 이미 remove 됨 |
+| ⑦ `takeCommands()` | 서버로 `CompleteWorkflowExecution` command 전송 | — |
+
+**핵심**: `#5` 처리 시점의 "큐에서 peek 한 command" vs "history 에서 들어온 command event" 매칭이 **결정론 검증의 모든 것**. 사용자 코드가 매번 다른 activityId 를 생성하면 ② 에서 `validateCommand()` 가 깨지고 `NonDeterministicException` 이 터진다.
 
 ## 핵심 설계 포인트
 
@@ -116,7 +150,16 @@ if (currentEvent.getEventId() >= workflowTaskStartedEventId && !hasNextEvent) {
 
 ### A. 해피 패스 — Schedule → Started → 종결
 
-Cancel 이 전혀 끼어들지 않는 흐름. 상태는 `CREATED → SCC → SER → STARTED → COMPLETED/FAILED/TIMED_OUT` 로 선형이다.
+**예시 상황**: `HelloActivity` 처럼 `activities.composeGreeting(...)` 한 번 호출하고 결과를 그냥 받는 코드. Cancel 이 전혀 끼어들지 않는다.
+
+```java
+// HelloActivity.java
+public String getGreeting(String name) {
+  return activities.composeGreeting("Hello", name);  // 호출 → block → 결과 리턴
+}
+```
+
+상태는 `CREATED → SCC → SER → STARTED → COMPLETED/FAILED/TIMED_OUT` 로 선형이다.
 
 ```mermaid
 stateDiagram-v2
@@ -141,9 +184,30 @@ stateDiagram-v2
 - `SER` 는 서버가 `ActivityTaskScheduled` 이벤트를 history 에 적어 승인한 상태. 아직 worker 가 polling 전.
 - `SER → TIMED_OUT` 은 ScheduleToStart 타임아웃 (polling 되지 못하고 타임아웃), `STARTED → TIMED_OUT` 은 StartToClose/Heartbeat 타임아웃.
 
+**HelloActivity 로 보는 전이 시점**:
+
+| 사용자 코드 / history event | 상태 전이 |
+| --- | --- |
+| `activities.composeGreeting(...)` 호출 (WFT1) | `CREATED → SCC` |
+| WFT1 끝에서 `prepareCommands()` → 서버로 반출 | `SCC → SCC` (self) |
+| `#5 ActivityTaskScheduled` 수신 (WFT2) | `SCC → SER` |
+| `#6 ActivityTaskStarted` 수신 | `SER → STARTED` |
+| `#7 ActivityTaskCompleted` 수신 | `STARTED → COMPLETED` → `stateMachines.remove(5)` |
+
 ### B. Started 이전 Cancel — command 큐에 있을 때 vs 서버 승인된 뒤
 
-Activity 가 `STARTED` 되기 전에 cancel 요청이 들어오는 경우. 서버 승인 여부(③축)에 따라 두 경로.
+**예시 상황**: Activity 를 schedule 해 두고 **아직 결과가 돌아오기 전에** scope 가 cancel 되는 경우. 두 가지 하위 상황이 있다:
+
+- **왼쪽 경로 (SCC → CANCELED)** — scope 안에서 async 로 activity 를 띄우고 **같은 WFT 안에서** 바로 cancel. 서버에 아직 아무것도 안 나감.
+  ```java
+  // 같은 workflow 안에서 조건 충족 시 activity 를 띄우지 말고 바로 접음
+  CancellationScope scope = Workflow.newCancellationScope(() -> {
+      Async.function(activities::expensive);  // ← SCC 로 들어감
+  });
+  scope.run();                                 // non-blocking
+  if (alreadyHaveCachedResult()) scope.cancel(); // ← 같은 WFT 안에서 cancel
+  ```
+- **오른쪽 경로 (SER → SACCC → SACER → CANCELED)** — 이전 WFT 가 끝나서 서버가 이미 `ActivityTaskScheduled` 를 history 에 적었지만 **worker 가 아직 polling 전**. 이 사이에 다음 WFT 에서 signal/timer 등이 scope cancel 을 트리거.
 
 ```mermaid
 stateDiagram-v2
@@ -171,7 +235,22 @@ stateDiagram-v2
 
 ### C. Started 이후 Cancel 경합 — 종결 이벤트와의 레이스
 
-이미 Activity 가 돌고 있는데 cancel 요청이 들어오는 경우. 서버 결과(COMPLETED/FAILED/TIMED_OUT)와 cancel 확정(CANCELED)의 **네 가지 종결 이벤트가 모두 가능**한 레이스 구간.
+**예시 상황**: 리포의 [`HelloCancellationScope`](../../core/src/main/java/io/temporal/samples/hello/HelloCancellationScope.java) — 같은 인사말을 여러 언어로 **병렬 호출**해서 **가장 먼저 끝난 하나만** 쓰고 나머지는 cancel 하는 패턴.
+
+```java
+// HelloCancellationScope.java
+CancellationScope scope =
+    Workflow.newCancellationScope(() -> {
+      for (String greeting : greetings) {                        // 6개 언어 병렬 호출
+        results.add(Async.function(activities::composeGreeting, greeting, name));
+      }
+    });
+scope.run();
+String result = Promise.anyOf(results).get();   // ★ 하나 끝나면 나머지는 아직 STARTED
+scope.cancel();                                  // ★ 나머지 5개 → STARTED → STACCC
+```
+
+하나가 먼저 completed 되는 순간, **나머지 5개는 이미 `STARTED` 상태로 돌고 있다**. `scope.cancel()` 이 호출되면 각자 `STARTED → STACCC` 로 넘어가고, 이후 서버 결과(COMPLETED/FAILED/TIMED_OUT)와 cancel 확정(CANCELED)의 **네 가지 종결 이벤트가 모두 가능**한 레이스 구간이 된다.
 
 ```mermaid
 stateDiagram-v2
@@ -195,6 +274,14 @@ stateDiagram-v2
 - `STACER` 에서 종결 이벤트 **4종을 모두 수용**해야 하는 이유 — Activity worker 가 cancel 신호를 받기 전에 이미 성공/실패/타임아웃으로 종료됐을 수 있다. "cancel 보냈다 ≠ cancel 로 끝난다".
 - 다이어그램 B 의 `SACER → STACER` 로 들어온 경우에도 여기 로직이 그대로 적용 — Scheduled 상태에서 cancel 요청했는데 서버가 Started 를 먼저 돌려준 케이스.
 - `STACCC → STACER` 전이 핸들러 `notifyCanceledIfTryCancelFromEvent` — 서버가 `CancelRequested` 를 돌려준 시점에 `TRY_CANCEL` 모드면 Promise complete.
+
+**HelloCancellationScope 의 cancel 모드**: 예시 코드는 `ActivityCancellationType.WAIT_CANCELLATION_COMPLETED` 로 설정돼 있어서, cancel 신호를 보내도 **서버가 `ActivityTaskCanceled` 를 돌려줄 때까지** 각 Promise 가 `.get()` 에서 계속 blocked. activity 쪽에서 heartbeat 중 `ActivityCompletionException` 을 catch 해 cleanup → 재throw 하면 그제서야 `STACER → CANCELED` 전이가 일어나고 Promise 가 `CanceledFailure` 로 완결된다.
+
+| cancel 모드 | 다이어그램 C 에서 Promise 가 complete 되는 시점 |
+| --- | --- |
+| `ABANDON` | 아예 complete 안 됨. activity 는 계속 돌지만 workflow 는 신경 안 씀 |
+| `TRY_CANCEL` | `STARTED → STACCC` 전이의 self-transition 에서 즉시 통지 (서버 응답 안 기다림) |
+| `WAIT_CANCELLATION_COMPLETED` ← 샘플 | `STACER → CANCELED` 가 일어날 때 통지 (서버 확정 대기) |
 
 <details>
 <summary>전체 상태 다이어그램 (12 상태 통합)</summary>
@@ -286,7 +373,12 @@ stateDiagram-v2
 
 ### A. 해피 패스 — Start → Fire
 
-Cancel 이 없는 흐름. 4개 상태를 직선으로 지난다.
+**예시 상황**: `Workflow.sleep(Duration.ofSeconds(10))` 처럼 timer 를 그냥 끝까지 기다리는 경우. Cancel 이 없는 흐름이라 4개 상태를 직선으로 지난다.
+
+```java
+// 가장 흔한 사용: 재시도 사이의 대기, 폴링 간격, SLA 타이머 등
+Workflow.sleep(Duration.ofSeconds(10));   // ← 내부적으로 TimerStateMachine 하나 생성
+```
 
 ```mermaid
 stateDiagram-v2
@@ -307,7 +399,20 @@ stateDiagram-v2
 
 ### B. Cancel 두 경로 — 서버 통신 전 vs 서버 통신 후
 
-`scope.cancel()` 이 들어왔을 때, timer 가 "아직 서버로 안 나갔는지 / 이미 서버가 돌리는 중인지" 로 두 경로가 갈린다.
+**예시 상황**: 리포의 [`HelloCancellationScopeWithTimer`](../../core/src/main/java/io/temporal/samples/hello/HelloCancellationScopeWithTimer.java) 와는 **반대 방향** — 저 샘플은 "timer 가 fire 되면 activity scope 를 cancel" 하는 패턴이고, 여기서는 "activity 가 먼저 끝나면 **timer 쪽을** cancel" 하는 패턴을 보자.
+
+```java
+// 예: activity 가 30초 안에 끝나면 60초 fallback timer 는 접는다
+Promise<String> activityResult = Async.function(activities::doWork);
+Promise<Void>  fallbackTimer  = Workflow.newTimer(Duration.ofSeconds(60));
+
+Promise.anyOf(activityResult, fallbackTimer).get();
+if (activityResult.isCompleted()) {
+    fallbackTimer.cancel();   // ★ 이 호출이 아래 두 경로 중 하나로 분기
+}
+```
+
+`fallbackTimer.cancel()` 이 호출될 때, timer 가 "아직 서버로 안 나갔는지 / 이미 서버가 돌리는 중인지" 에 따라 두 경로가 갈린다.
 
 ```mermaid
 stateDiagram-v2
@@ -368,6 +473,44 @@ private void notifyCancellation() {
 ```
 
 호출 측(상위 Workflow 런타임) 입장에서는 "서버가 보낸 CANCELED 이벤트"와 "SDK가 조립한 가짜 CANCELED 이벤트"를 **같은 코드 경로**로 처리할 수 있다. 두 경로 모두 Promise 를 `CanceledFailure` 로 fail 시킴.
+
+### 샘플 2 — `HelloCancellationScopeWithTimer`: Timer fire 가 Activity cancel 을 트리거
+
+리포의 [`HelloCancellationScopeWithTimer`](../../core/src/main/java/io/temporal/samples/hello/HelloCancellationScopeWithTimer.java) 는 **두 state machine 이 서로 영향을 주는** 전형적인 패턴이다. "activity 가 3초 안에 안 끝나면 접고 기본값 리턴".
+
+```java
+// HelloCancellationScopeWithTimer.java
+CancellationScope cancellationScope =
+    Workflow.newCancellationScope(() -> {
+      result = activities.updateInfo(input);               // Activity SM 생성
+    });
+
+Workflow.newTimer(Duration.ofSeconds(3))                   // Timer SM 생성
+    .thenApply(r -> { cancellationScope.cancel(); return null; });  // ★ fire 시 scope cancel
+
+cancellationScope.run();                                    // Activity 블록 대기
+```
+
+**두 state machine 의 동시 진행**:
+
+| 시점 | Activity SM | Timer SM | 비고 |
+| --- | --- | --- | --- |
+| WFT1: 사용자 코드 실행 | `CREATED → SCC` | `CREATED → SCC` | 두 command 가 큐에 push |
+| WFT1 끝: `takeCommands()` | `SCC → SCC` (self) | `SCC → SCC` (self) | `ScheduleActivityTask` + `StartTimer` 둘 다 서버로 |
+| WFT2: `ActivityTaskScheduled` | `SCC → SER` | — | — |
+| WFT2: `TimerStarted` | — | `SCC → SCR` | — |
+| WFT2: `ActivityTaskStarted` | `SER → STARTED` | — | activity worker 가 heartbeat 시작 |
+| WFT3 (3초 뒤): `TimerFired` | — | `SCR → FIRED` → `notifyCompletion` | timer promise 깨어남 → `thenApply` 람다 실행 → `scope.cancel()` 호출 |
+| 같은 WFT 내: `scope.cancel()` 효과 | `STARTED → STACCC` | — | `RequestCancelActivityTask` command push |
+| WFT3 끝: `takeCommands()` | `STACCC → STACCC` (self) | — | 서버로 cancel 요청 전송 |
+| WFT4: `ActivityTaskCancelRequested` | `STACCC → STACER` | — | — |
+| WFT4+: 서버 결과 | `STACER → CANCELED` (또는 COMPLETED — 레이스) | — | activity 가 heartbeat 로 cancel 받고 cleanup 후 throw → CANCELED |
+
+**읽기 포인트**:
+
+- Timer SM 과 Activity SM 은 **독립적으로** 자기 history event 를 처리한다 — 서로 참조하지 않음. 둘을 연결하는 건 **사용자 코드 (`thenApply` 람다)** 뿐.
+- `TimerFired` 가 들어오는 WFT 안에서 `scope.cancel()` 이 호출되면, 그 즉시 Activity SM 에 `CANCEL` explicit 전이가 투입된다. 즉 **같은 WFT 안에서 두 SM 이 연쇄 전이**.
+- 샘플이 `WAIT_CANCELLATION_COMPLETED` 모드라서 activity 쪽 Promise 는 `STACER → CANCELED` 가 일어나야 fail. 그 전까지 `cancellationScope.run()` 이 return 안 함.
 
 **ActivityStateMachine 과의 비교**:
 
