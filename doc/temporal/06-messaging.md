@@ -116,6 +116,68 @@ sequenceDiagram
 @SignalMethod public void setData(Data d) { dataPromise.complete(d); }
 ```
 
+**패턴 4 — sibling/child Workflow → parent 결과 콜백** (`newExternalWorkflowStub` + `Workflow.await`)
+
+긴 작업을 Activity 안에서 결과까지 기다리면 Activity 타임아웃이 터진다. 대신 **Activity 는 다른 Workflow 를 fire-and-forget 으로 띄우기만** 하고, 그 Workflow 가 끝날 때 **Signal 로 결과를 돌려주는** 패턴. `Workflow.newChildWorkflowStub` + `Async.function` 과 달리 **부모-자식 lifecycle 로 묶이지 않는 완전 독립 실행**이 필요할 때 쓴다(§04 참고).
+
+```java
+// ============ Parent Workflow — Signal 대기 ============
+public class OrderWorkflowImpl implements OrderWorkflow {
+    private ApprovalResult approvalResult;   // Signal로 채워질 상태
+
+    @Override
+    public String process(String orderId) {
+        String myId = Workflow.getInfo().getWorkflowId();     // ← 콜백 주소
+        activities.startApprovalWorkflow(orderId, myId);      // sibling 띄우기 (fire-and-forget)
+
+        boolean got = Workflow.await(                         // ★ 타임아웃 필수
+            Duration.ofHours(2),
+            () -> approvalResult != null);
+        if (!got) throw ApplicationFailure.newFailure("timeout", "TIMEOUT");
+
+        return approvalResult.approved() ? "approved" : "rejected";
+    }
+
+    @Override
+    public void onApprovalResult(ApprovalResult r) { this.approvalResult = r; }  // Signal 핸들러
+}
+
+// ============ Sibling Workflow — 종료 시 Signal 송신 ============
+public class PaymentApprovalWorkflowImpl implements PaymentApprovalWorkflow {
+    @Override
+    public void approve(String orderId, String callbackWorkflowId) {
+        ApprovalResult result;
+        try {
+            boolean ok = activities.callExternalApi(orderId);  // 긴 작업 (수 시간 가능)
+            result = new ApprovalResult(ok, ok ? "ok" : "declined");
+        } catch (Exception e) {
+            // ★ 실패해도 반드시 Signal — 안 보내면 부모가 영원히 await
+            result = new ApprovalResult(false, "error:" + e.getMessage());
+        }
+        // 부모에게 Signal
+        OrderWorkflow parent = Workflow.newExternalWorkflowStub(
+            OrderWorkflow.class, callbackWorkflowId);
+        parent.onApprovalResult(result);     // → SignalExternalWorkflowExecution command
+    }
+}
+```
+
+**규칙**:
+- **부모가 자기 `workflowId` 를 인자로 넘긴다** — `Workflow.getInfo().getWorkflowId()` 로. hardcode 금지(테스트에서 깨짐, 재사용 불가).
+- **자식/sibling 은 성공/실패 공통으로 Signal 을 쏜다** — 예외로 죽으면 Signal 안 가고 부모 좀비. `try/catch` 로 실패 Signal 이라도 보장.
+- **부모의 `Workflow.await` 에 반드시 `Duration` 타임아웃** — 콜백 유실 시 좀비 방지. 타임아웃 터지면 `ApplicationFailure` 로 명시적 종료.
+- **Signal 중복 수신 대비** — `approvalResult != null` 체크로 덮어쓰기 전략 결정하거나 ID 기반 멱등 처리.
+- **sibling 띄우는 Activity 의 멱등성** — Activity 재시도 대비 결정론적 `workflowId` + `WorkflowIdReusePolicy.ALLOW_DUPLICATE` + `WorkflowExecutionAlreadyStarted` 캐치 (§04 Composition 참고).
+
+**ChildWorkflow + Promise 와의 선택 기준**:
+
+| 요구 | 선택 |
+| --- | --- |
+| 부모 끝나면 자식도 끊어도 됨 (lifecycle 묶음) | `Workflow.newChildWorkflowStub` + `Async.function` → `Promise<T>` |
+| 자식이 부모보다 오래 살아야 함 / 부모 터져도 자식 계속 돌아야 함 | **Signal 콜백 패턴** (Activity 로 띄우기 + Signal 수신) |
+| Temporal UI 에서 부모-자식 트리로 묶여 보여야 함 | ChildWorkflow |
+| Temporal UI 에서 독립 root execution 으로 보여야 함 | **Signal 콜백 패턴** |
+
 ### `signalWithStart` 유즈케이스
 
 - "주문이 들어왔다"는 Signal을 쐈을 때 **처음이면 Workflow 시작, 두 번째부터는 기존 Workflow에 Signal 추가**하는 패턴 (아래 §19 Accumulator 샘플).

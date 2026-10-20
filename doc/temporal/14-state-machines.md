@@ -34,6 +34,80 @@ flowchart TD
     nonStateful --> takeCommands
 ```
 
+## 세 개의 내부 큐 — `cancellableCommands` / `commands` / `messageOutbox`
+
+`WorkflowStateMachines` 가 외부 반출(=서버 전송) 하기 전까지 **메모리에 쌓는 세 개의 큐**가 있다. 샘플 추적 테이블의 "큐 상태" 컬럼이 가리키는 바로 그 큐들.
+
+```java
+// io.temporal.internal.statemachines.WorkflowStateMachines
+private final Queue<CancellableCommand> cancellableCommands = new ArrayDeque<>();
+private final Queue<CancellableCommand> commands             = new ArrayDeque<>();
+private final Queue<Message>            messageOutbox        = new ArrayDeque<>();
+```
+
+### 역할
+
+| 큐 | 담기는 것 | 특징 |
+| --- | --- | --- |
+| **`cancellableCommands`** | WFT 처리 **중에** 사용자 코드가 유발한 command (`ScheduleActivityTask`, `StartTimer`, `StartChildWorkflowExecution`, `CompleteWorkflowExecution` …) | **아직 서버로 안 나감** — 같은 WFT 안에서 `scope.cancel()` 등으로 **큐에서 바로 제거/취소 가능**. 이름의 `Cancellable`이 그 뜻. |
+| **`commands`** | `prepareCommands()` 호출 시점에 `cancellableCommands` 에서 **순서 그대로 이동**해 온, 전송 확정분 | `takeCommands()` 가 `drainTo` 로 꺼내 `RespondWorkflowTaskCompleted` 로 서버에 반출. **순서 고정 — 중간 삽입·삭제 금지**(결정론 보존) |
+| **`messageOutbox`** | Update 프로토콜 메시지 (`Accepted` / `Completed` / `Rejected`) | command 가 아니라 **별개 축의 프로토콜 메시지**. 같은 WFT 응답 안에서 `commands` 와 **분리된 필드**로 함께 전송 |
+
+### 전이 다이어그램
+
+```mermaid
+flowchart LR
+    code["사용자 Workflow 코드<br/>activities.foo() / Workflow.newTimer() /<br/>Workflow.newChildWorkflowStub()..."] -->|SCHEDULE 트리거| cc["<b>cancellableCommands</b><br/>(WFT 처리 중 누적)"]
+    cc -->|scope.cancel() / timer.cancel()<br/>같은 WFT 안이면 큐에서 제거| gone["🗑️ (서버로 안 나감)"]
+    cc -->|prepareCommands()<br/>WFT 종료 직전| cmds["<b>commands</b><br/>(전송 확정, 순서 고정)"]
+    upd["Update 핸들러 흐름<br/>Accepted / Completed / Rejected"] --> mo["<b>messageOutbox</b><br/>(프로토콜 메시지)"]
+    cmds -->|takeCommands()<br/>drainTo| rpc["RespondWorkflowTaskCompleted<br/>commands 필드"]
+    mo -->|drainTo| rpc2["RespondWorkflowTaskCompleted<br/>messages 필드"]
+```
+
+### 예제 데이터 — 한 WFT 안에서의 큐 변화
+
+주문 워크플로가 (1) 타이머를 띄우고 (2) 액티비티를 띄운 뒤 (3) 중간에 타이머를 cancel 하고 (4) 같은 WFT 에서 Update Accepted 를 발행하는 경우:
+
+```
+[WFT 시작]
+cancellableCommands = []
+commands            = []
+messageOutbox       = []
+
+[① Workflow.newTimer(Duration.ofSeconds(10))]
+cancellableCommands = [StartTimer{timerId=t1, 10s}]
+
+[② activities.charge(orderId)]
+cancellableCommands = [StartTimer{t1}, ScheduleActivityTask{a1, "charge"}]
+
+[③ timer.cancel()  — 아직 같은 WFT 안, 서버 미전송이라 그냥 큐에서 제거]
+cancellableCommands = [ScheduleActivityTask{a1, "charge"}]
+
+[④ Update "setStatus" Accepted — 프로토콜 메시지]
+messageOutbox       = [Message{id=upd-7/accept, body=Accepted{}}]
+
+[WFT 종료 — prepareCommands()]
+cancellableCommands = []
+commands            = [ScheduleActivityTask{a1, "charge"}]
+messageOutbox       = [Message{id=upd-7/accept, body=Accepted{}}]
+
+[takeCommands() + takeMessages() → RespondWorkflowTaskCompleted]
+서버로 commands + messages 함께 전송
+```
+
+### 왜 세 개로 나눠놨나
+
+- **`cancellableCommands` 분리** — Temporal 워크플로에서 "command 발행 → 같은 WFT 안에서 취소"가 자주 생긴다(타이머·액티비티 취소, Saga 보상 분기 등). 서버에 보내기 전까지는 메모리에서 **자유롭게 지울 수 있어야** 하니 별도 큐.
+- **`commands` 분리** — 반출 확정 후에는 **순서·내용 변경 금지**(결정론). `prepareCommands()` 가 "스냅샷을 뜬 그 순간" 이후로는 손대지 않도록 다른 큐로 격리.
+- **`messageOutbox` 분리** — Update 프로토콜 메시지(`Accepted/Completed/Rejected`)는 **command 가 아니라** 다른 축의 메시지. 서버 응답 `RespondWorkflowTaskCompleted` 에도 `commands`·`messages` 필드가 분리돼 있어, SDK 쪽도 **원본 그대로 분리** 유지.
+
+### 샘플 추적 테이블의 "큐 상태" 컬럼이 가리키는 것
+
+바로 아래 `HelloActivity` 추적 테이블의 "큐 상태" 컬럼은 이 세 큐 중 **대부분 `cancellableCommands`** 를 가리킨다. ⑥의 `prepareCommands()` 호출 시점에만 `cancellableCommands → commands` 전이가 일어나고, ⑦에서 `commands` 가 drain 되며 모두 비워진다.
+
+---
+
 ## 샘플 1 — `HelloActivity` 전체 추적
 
 리포의 [`HelloActivity.java`](../../core/src/main/java/io/temporal/samples/hello/HelloActivity.java) 를 끝까지 따라가 본다. **Activity 1회 → 완료** 하는 가장 단순한 workflow 라 전체 파이프라인이 다 보인다.

@@ -324,6 +324,93 @@ untyped.executeAsync(String.class, "Hello", name);
 - `ChildWorkflowOptions`에만 있는 것: `ParentClosePolicy`, `CancellationType`.
 - `WorkflowOptions`에만 있는 것: `StartDelay`, `DisableEagerExecution` (스타터에서 시작할 때만 의미 있음).
 
+### ChildWorkflow 대신 Activity 에서 sibling 워크플로 띄우기 (lifecycle 완전 분리)
+
+**ChildWorkflow 가 안 맞는 경우가 있다**: 띄운 워크플로가 **부모보다 오래 살아야 하거나**, Temporal UI 에서 **부모-자식 트리로 묶이지 않고 독립 root execution 으로 보여야** 할 때. `ParentClosePolicy.ABANDON` 으로도 비슷하게 흉내낼 수 있지만, "완전 분리" 가 필요하면 Activity 안에서 `WorkflowClient.start` 를 호출하는 패턴이 깔끔하다.
+
+**Workflow 코드 안에서 `WorkflowClient` 직접 사용은 금지**(결정론 위반). 그래서 반드시 **Activity 를 한 겹** 끼운다.
+
+```java
+// ============ Activity 인터페이스 ============
+@ActivityInterface
+public interface OrchestrationActivities {
+    void startNotificationWorkflow(String orderId, String result);
+}
+
+// ============ Activity Impl — WorkflowClient 주입 ============
+public class OrchestrationActivitiesImpl implements OrchestrationActivities {
+    private final WorkflowClient client;   // ← 생성자로 주입 (Worker 등록 시점에)
+
+    public OrchestrationActivitiesImpl(WorkflowClient client) { this.client = client; }
+
+    @Override
+    public void startNotificationWorkflow(String orderId, String result) {
+        WorkflowOptions opts = WorkflowOptions.newBuilder()
+            .setTaskQueue("NotificationTQ")
+            .setWorkflowId("notification-" + orderId)                                   // ★ 결정론적 ID
+            .setWorkflowIdReusePolicy(
+                WorkflowIdReusePolicy.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE)         // ★ 재시도 대비
+            .build();
+
+        NotificationWorkflow stub = client.newWorkflowStub(NotificationWorkflow.class, opts);
+        try {
+            WorkflowClient.start(stub::notify, orderId, result);                        // fire-and-forget
+        } catch (WorkflowExecutionAlreadyStarted ignore) {
+            // Activity at-least-once 재시도로 이미 떠있음 → 성공으로 처리
+        }
+    }
+}
+
+// ============ Parent Workflow — Activity 호출 ============
+public class OrderWorkflowImpl implements OrderWorkflow {
+    private final OrchestrationActivities activities = Workflow.newActivityStub(
+        OrchestrationActivities.class,
+        ActivityOptions.newBuilder().setStartToCloseTimeout(Duration.ofSeconds(10)).build());
+
+    @Override
+    public String process(String orderId) {
+        String result = "charged:" + orderId;
+        activities.startNotificationWorkflow(orderId, result);  // sibling 띄움 (부모 lifecycle 과 무관)
+        return result;
+    }
+}
+
+// ============ Worker 등록 — WorkflowClient 주입 ============
+Worker orderWorker = factory.newWorker("OrderTQ");
+orderWorker.registerWorkflowImplementationTypes(OrderWorkflowImpl.class);
+orderWorker.registerActivitiesImplementations(new OrchestrationActivitiesImpl(client));  // ← 주입
+```
+
+#### 멱등성이 핵심
+
+Activity 는 **at-least-once** 보장이라 재시도로 Activity 메서드가 여러 번 돌 수 있다. 단순히 `WorkflowClient.start(...)` 만 호출하면 재시도마다 **새 워크플로가 또 뜬다**. 반드시:
+
+1. **결정론적 `workflowId`** — 입력에서 유도 (`"notification-" + orderId` 등). UUID 금지.
+2. **`WorkflowIdReusePolicy.ALLOW_DUPLICATE`** — 종료된 ID 재사용 허용 (세션/debounce 패턴에선 보통 OK).
+3. **`WorkflowExecutionAlreadyStarted` 캐치** — 이미 실행 중이면 성공 처리.
+
+#### 결과를 돌려받고 싶으면
+
+Activity 안에서 `execute(...).get()` 로 기다리면 **Activity 타임아웃이 터지기 쉽다**. 두 가지 대안:
+- **짧은 작업**: `WorkflowClient.execute(stub::method, args).get(..., TimeUnit)` + Activity heartbeat 유지
+- **긴 작업**: fire-and-forget 으로 띄우고 `workflowId` 만 받은 뒤, **sibling 이 Signal 로 결과 돌려주기**(§06 Signal 패턴 4 — "sibling → parent 콜백")
+
+#### `WorkflowClient` 주입 주의
+
+- Activity 메서드 안에서 **매번** `WorkflowClient.newInstance(...)` 금지 — gRPC 커넥션 낭비. **생성자 주입** 1회.
+- Activity Impl 인스턴스는 Worker 등록 시 1회 생성되어 **스레드 세이프하게 공유**됨. `WorkflowClient` 도 스레드 세이프.
+
+#### ChildWorkflow vs Activity → sibling 결정표
+
+| 요구 | ChildWorkflow | Activity → sibling |
+| --- | --- | --- |
+| 부모-자식 트리로 UI 노출 | ✅ | ❌ (독립 root) |
+| 부모 종료 시 자동 cleanup | `ParentClosePolicy.TERMINATE/REQUEST_CANCEL` | ❌ (수동) |
+| 자식이 부모보다 오래 살아야 함 | `ABANDON` 으로 가능 | ✅ 더 자연스러움 |
+| 결정론 보장되는 TaskQueue 분기 | ✅ | ✅ |
+| 결과를 `Promise` 로 받기 | ✅ `Async.function` → Promise | ❌ (Signal 콜백으로 돌려받기) |
+| Activity 재시도 멱등성 신경쓸 필요 | ❌ | ✅ (ID 설계 필요) |
+
 ---
 ## 13. `NexusServiceOptions` / `NexusOperationOptions` — Nexus 서비스 호출 옵션
 
