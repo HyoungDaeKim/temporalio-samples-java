@@ -239,14 +239,14 @@ public String getGreeting(String name) {
 stateDiagram-v2
     direction LR
     [*] --> CREATED
-    CREATED --> SCC : SCHEDULE (explicit)<br/>createScheduleActivityTaskCommand
-    SCC --> SCC : CMD_SCHEDULE_ACTIVITY_TASK (self)
-    SCC --> SER : EVT_ACTIVITY_TASK_SCHEDULED<br/>setInitialCommandEventId
-    SER --> STARTED : EVT_ACTIVITY_TASK_STARTED<br/>setStartedCommandEventId
-    SER --> TIMED_OUT : EVT_ACTIVITY_TASK_TIMED_OUT<br/>notifyTimedOut
-    STARTED --> COMPLETED : EVT_ACTIVITY_TASK_COMPLETED<br/>notifyCompleted
-    STARTED --> FAILED : EVT_ACTIVITY_TASK_FAILED<br/>notifyFailed
-    STARTED --> TIMED_OUT : EVT_ACTIVITY_TASK_TIMED_OUT<br/>notifyTimedOut
+    CREATED --> SCC : SCHEDULE explicit / createScheduleActivityTaskCommand
+    SCC --> SCC : CMD_SCHEDULE_ACTIVITY_TASK self
+    SCC --> SER : EVT_ACTIVITY_TASK_SCHEDULED / setInitialCommandEventId
+    SER --> STARTED : EVT_ACTIVITY_TASK_STARTED / setStartedCommandEventId
+    SER --> TIMED_OUT : EVT_ACTIVITY_TASK_TIMED_OUT / notifyTimedOut
+    STARTED --> COMPLETED : EVT_ACTIVITY_TASK_COMPLETED / notifyCompleted
+    STARTED --> FAILED : EVT_ACTIVITY_TASK_FAILED / notifyFailed
+    STARTED --> TIMED_OUT : EVT_ACTIVITY_TASK_TIMED_OUT / notifyTimedOut
     COMPLETED --> [*]
     FAILED --> [*]
     TIMED_OUT --> [*]
@@ -287,17 +287,16 @@ stateDiagram-v2
 stateDiagram-v2
     direction LR
     [*] --> SCC
-    SCC --> CANCELED : CANCEL (큐에서 바로 제거)<br/>cancelCommandNotifyCanceledImmediately
+    SCC --> CANCELED : CANCEL queue remove / cancelCommandNotifyCanceledImmediately
     SCC --> SER : EVT_ACTIVITY_TASK_SCHEDULED
-    SER --> SACCC : CANCEL<br/>createRequestCancelActivityTaskCommand
-    SACCC --> SACCC : CMD_REQ_CANCEL (self)<br/>notifyCanceledIfTryCancelImmediately
+    SER --> SACCC : CANCEL / createRequestCancelActivityTaskCommand
+    SACCC --> SACCC : CMD_REQ_CANCEL self / notifyCanceledIfTryCancelImmediately
     SACCC --> SACER : EVT_ACTIVITY_TASK_CANCEL_REQUESTED
-    SACER --> CANCELED : EVT_ACTIVITY_TASK_CANCELED<br/>notifyCanceledFromEvent
-    SACER --> TIMED_OUT : EVT_ACTIVITY_TASK_TIMED_OUT<br/>notifyTimedOut
-    SACER --> STACER : EVT_ACTIVITY_TASK_STARTED<br/>(→ 다이어그램 C 로 넘어감)
+    SACER --> CANCELED : EVT_ACTIVITY_TASK_CANCELED / notifyCanceledFromEvent
+    SACER --> TIMED_OUT : EVT_ACTIVITY_TASK_TIMED_OUT / notifyTimedOut
+    SACER --> STACER : EVT_ACTIVITY_TASK_STARTED / to diagram C
     CANCELED --> [*]
     TIMED_OUT --> [*]
-    STACER --> [*] : (continued in C)
 ```
 
 **읽기 포인트**:
@@ -330,13 +329,13 @@ scope.cancel();                                  // ★ 나머지 5개 → START
 stateDiagram-v2
     direction LR
     [*] --> STARTED
-    STARTED --> STACCC : CANCEL<br/>createRequestCancelActivityTaskCommand
-    STACCC --> STACCC : CMD_REQ_CANCEL (self)
-    STACCC --> STACER : EVT_ACTIVITY_TASK_CANCEL_REQUESTED<br/>notifyCanceledIfTryCancelFromEvent
-    STACER --> COMPLETED : EVT_ACTIVITY_TASK_COMPLETED<br/>notifyCompleted
-    STACER --> FAILED : EVT_ACTIVITY_TASK_FAILED<br/>notifyFailed
-    STACER --> TIMED_OUT : EVT_ACTIVITY_TASK_TIMED_OUT<br/>notifyTimedOut
-    STACER --> CANCELED : EVT_ACTIVITY_TASK_CANCELED<br/>notifyCancellationFromEvent
+    STARTED --> STACCC : CANCEL / createRequestCancelActivityTaskCommand
+    STACCC --> STACCC : CMD_REQ_CANCEL self
+    STACCC --> STACER : EVT_ACTIVITY_TASK_CANCEL_REQUESTED / notifyCanceledIfTryCancelFromEvent
+    STACER --> COMPLETED : EVT_ACTIVITY_TASK_COMPLETED / notifyCompleted
+    STACER --> FAILED : EVT_ACTIVITY_TASK_FAILED / notifyFailed
+    STACER --> TIMED_OUT : EVT_ACTIVITY_TASK_TIMED_OUT / notifyTimedOut
+    STACER --> CANCELED : EVT_ACTIVITY_TASK_CANCELED / notifyCancellationFromEvent
     COMPLETED --> [*]
     FAILED --> [*]
     TIMED_OUT --> [*]
@@ -458,10 +457,10 @@ Workflow.sleep(Duration.ofSeconds(10));   // ← 내부적으로 TimerStateMachi
 stateDiagram-v2
     direction LR
     [*] --> CREATED
-    CREATED --> SCC : SCHEDULE (explicit)<br/>createStartTimerCommand
-    SCC --> SCC : CMD_START_TIMER (self)
-    SCC --> SCR : EVT_TIMER_STARTED<br/>setInitialCommandEventId
-    SCR --> FIRED : EVT_TIMER_FIRED<br/>notifyCompletion
+    CREATED --> SCC : SCHEDULE explicit / createStartTimerCommand
+    SCC --> SCC : CMD_START_TIMER self
+    SCC --> SCR : EVT_TIMER_STARTED / setInitialCommandEventId
+    SCR --> FIRED : EVT_TIMER_FIRED / notifyCompletion
     FIRED --> [*]
 ```
 
@@ -492,11 +491,11 @@ if (activityResult.isCompleted()) {
 stateDiagram-v2
     direction LR
     [*] --> SCC
-    SCC --> CANCELED : CANCEL (큐에서 바로 제거)<br/>cancelStartTimerCommand
+    SCC --> CANCELED : CANCEL queue remove / cancelStartTimerCommand
     SCC --> SCR : EVT_TIMER_STARTED
-    SCR --> CTCC : CANCEL<br/>createCancelTimerCommand
-    CTCC --> CTCC : CANCEL (self, 중복 흡수)
-    CTCC --> CTCS : CMD_CANCEL_TIMER<br/>notifyCancellation (즉시 통지)
+    SCR --> CTCC : CANCEL / createCancelTimerCommand
+    CTCC --> CTCC : CANCEL self duplicate absorb
+    CTCC --> CTCS : CMD_CANCEL_TIMER / notifyCancellation immediate
     CTCS --> CANCELED : EVT_TIMER_CANCELED
     CANCELED --> [*]
 ```

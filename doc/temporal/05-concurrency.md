@@ -432,6 +432,8 @@ class CompletablePromiseImpl<V> implements CompletablePromise<V> {
 
 특별한 reactive stream 도, 디스패처도 없다. `ArrayList` 하나.
 
+> **왜 `value` 와 `failure` 를 두 필드로 분리?** 성공값과 실패 예외는 상호배타적이고, 어느 쪽이 세팅됐는지는 `complete(v)` 가 호출됐나 `completeExceptionally(e)` 가 호출됐나로 결정된다. `Object result` 하나로 합치면 성공값이 실제로 `RuntimeException` 타입일 때 구분이 애매해지고, `instanceof` 체크가 필요하다. 제네릭 `V` 와 `RuntimeException` 을 그대로 타입 보존한 채 저장할 수 있어 캐스팅/박싱도 없다. 그리고 둘 다 `static`/`volatile`/`synchronized` 아님 — 아래에서 설명하는 단일 스레드 러너 전제 때문.
+
 #### `thenApply` / `handle` / `exceptionally` 는 전부 private `then()` 으로 수렴
 
 ```java
@@ -534,6 +536,153 @@ scope.cancellationPromise  (CompletablePromiseImpl<String>)
 1. **워크플로 코드는 단일 스레드** — `DeterministicRunner` 가 workflow thread를 하나씩만 깨움. `handlers.add` ↔ `invokeHandlers` 경합 없음. `ArrayList` 를 synchronized 없이 써도 안전.
 2. **등록 순서 = 발화 순서, 둘 다 결정적** — 사용자 코드가 결정적이면 핸들러 등록 순서도 결정적이고, for 루프라 발화 순서도 결정적 → 리플레이 때 동일.
 3. **`complete` 멱등** — `completeFrom` 등으로 중복 완료 시도되어도 두 번째부터는 `completed==true` 체크로 무시.
+
+#### `thenCompose` + `completeFrom` — flatMap: 함수가 또 Promise 를 돌려줄 때
+
+`thenApply(f)` 는 `f: V -> U` 지만, `thenCompose(f)` 는 `f: V -> Promise<U>`. **함수가 또 다른 비동기 작업** 을 돌려주는 경우(다른 Activity 결과를 받아 또 Activity 를 호출하는 식). 중첩 `Promise<Promise<U>>` 를 평탄화해야 하는데 이게 `completeFrom` 의 역할.
+
+```java
+@Override
+public <U> Promise<U> thenCompose(Functions.Func1<? super V, ? extends Promise<U>> fn) {
+  return then((result) -> {
+    if (failure != null) {
+      result.completeExceptionally(failure);
+      return;
+    }
+    try {
+      Promise<U> r = fn.apply(value);         // ← fn 이 또 Promise 를 돌려줌
+      result.completeFrom(r);                 // ← r 이 끝나면 result 도 자동 완료
+    } catch (RuntimeException e) {
+      result.completeExceptionally(e);
+    }
+  });
+}
+
+@Override
+public boolean completeFrom(Promise<V> source) {
+  if (completed) return false;
+  source.handle(
+      (value, failure) -> {
+        if (failure != null) this.completeExceptionally(failure);
+        else                  this.complete(value);
+        return null;                          // handle 리턴값은 안 씀
+      });
+  return true;
+}
+```
+
+`completeFrom` 은 **본인이 뭘 하지 않는다**. `source.handle(...)` 로 `source.handlers` 에 "완료되면 내 complete 를 호출해라" 람다 한 개를 걸어두고 끝. 위 §16 콜백 체이닝 메커니즘을 그대로 재사용 — `source` 완료 → `invokeHandlers()` → 람다 실행 → `this.complete(value)` → `this` 의 하위 체인 전파. 재귀적인 자기 유사 구조.
+
+왜 `result.complete(r.get())` 처럼 블로킹으로 꺼낼 수 없나? 워크플로 스레드가 멈추면 안 되고(결정론 러너 위), `r` 이 아직 완료 안 됐을 수 있기 때문. "r 이 끝나면 그 결과를 그대로 나에게 복사" 를 등록만 해둔다.
+
+#### 미처리 실패 안전망 — `DeterministicRunnerImpl.failedPromises`
+
+Promise 가 **예외로 완료됐는데 아무도 `get()`/`then()` 등으로 그 예외를 꺼내가지 않으면** 조용히 삼켜질 위험이 있다 (`CompletableFuture.exceptionally()` 안 건 것과 같은 상황). Temporal 은 러너 레벨에서 수집해두고 종료 시점에 WARN 로그로 가시화한다.
+
+**등록 — `completeExceptionally` 안쪽:**
+
+```java
+public boolean completeExceptionally(RuntimeException value) {
+  if (completed) return false;
+  this.completed = true;
+  this.failure = value;
+  boolean invoked = invokeHandlers();
+  if (!invoked) {                              // ← 핸들러 비어있는 상태로 실패
+    runner.registerFailedPromise(this);
+    registeredWithRunner = true;
+  }
+  return true;
+}
+```
+
+**해제 — `then()` 에서 뒤늦게 핸들러가 걸리는 경로:**
+
+```java
+private <U> Promise<U> then(Functions.Proc1<CompletablePromise<U>> proc) {
+  CompletablePromise<U> resultPromise = new CompletablePromiseImpl<>();
+  if (completed) {
+    proc.apply(resultPromise);
+    unregisterWithRunner();                     // ← "이제 처리됐으니 목록에서 빼라"
+  } else {
+    handlers.add(() -> proc.apply(resultPromise));
+  }
+  return resultPromise;
+}
+
+private void unregisterWithRunner() {
+  if (registeredWithRunner) {
+    runner.forgetFailedPromise(this);
+    registeredWithRunner = false;
+  }
+}
+```
+
+**러너 쪽 저장소 — `DeterministicRunnerImpl`:**
+
+```java
+private final Set<Promise<?>> failedPromises = new HashSet<>();
+
+void registerFailedPromise(Promise<?> promise) {
+  if (!promise.isCompleted()) throw new Error("expected failed");  // 이미 실패 완료된 것만 올 수 있다는 불변식
+  failedPromises.add(promise);
+}
+
+void forgetFailedPromise(Promise<?> promise) {
+  failedPromises.remove(promise);
+}
+```
+
+**드레인 — `close()` 가 종료 시 WARN 로그로 가시화:**
+
+```java
+// f.get() will remove the promise directly from failedPromises
+// → iterating failedPromises directly throws ConcurrentModificationException
+// → loop over a copy
+Set<Promise<?>> failedPromisesLoop = new HashSet<>(failedPromises);
+for (Promise<?> f : failedPromisesLoop) {
+  try {
+    f.get();                                   // 실패 Promise 라 반드시 throw
+    throw new Error("unreachable");
+  } catch (RuntimeException e) {
+    log.warn(
+        "Promise completed with exception and was never accessed. "
+        + "The ignored exception:",
+        CheckedExceptionWrapper.unwrap(e));
+  }
+}
+```
+
+주석의 함정: `f.get()` 호출 경로가 결국 `unregisterWithRunner()` → `forgetFailedPromise()` → `failedPromises.remove(f)` 를 트리거하기 때문에 **원본 Set 을 그대로 iterate 하면 `ConcurrentModificationException`**. 그래서 **복사본을 만들어 순회**.
+
+전체 흐름:
+
+```
+[완료 시점]
+  completeExceptionally(e)
+      │
+      ├─ handlers 비어있음 ───► runner.registerFailedPromise(this)
+      │                            └─ failedPromises.add(this)
+      │
+      └─ handlers 있음      ───► 하위 Promise 로 예외 전파 (등록 안 함)
+
+[나중에 누군가 소비]
+  someone.get() / then() / handle() ...
+      │
+      └─ unregisterWithRunner()
+            └─ runner.forgetFailedPromise(this)
+                  └─ failedPromises.remove(this)
+
+[워크플로 종료]
+  runner.close()
+      │
+      └─ failedPromises 복사본 순회
+            └─ f.get() 호출 → RuntimeException 캐치 → WARN 로그
+```
+
+핵심 특성:
+- **WARN 로그만, 워크플로 실패 아님** — "핸들러를 안 걸었다" 는 유저 코드 스타일 문제지 결정론 위반이 아니라서 가시화만 함.
+- **단일 스레드 러너 전제** — `HashSet` 에 synchronized 없음. 유일하게 조심할 포인트는 "순회 중 수정" 이고 그건 복사본으로 우회.
+- **Node.js `unhandledRejection` 과 유사한 포지션** — 조용히 삼켜지는 예외를 운영자가 감지하도록.
 
 #### 자주 하는 실수 (내부 구현 관련)
 
