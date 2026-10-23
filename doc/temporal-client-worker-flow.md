@@ -127,6 +127,75 @@ WorkflowClient.start(workflow::getGreeting);   // 이 라인에서 메서드 바
 
 ---
 
+## 개념 파악 — Replay 비용과 Activity 분리 원칙
+
+Workflow 는 매 WFT 마다 코드를 **처음부터 replay** 해서 상태를 복원한다. 그래서 workflow 메서드 안의 모든 순수 로직은 WFT 수만큼 반복 실행된다는 게 전제가 된다.
+
+```java
+@WorkflowMethod
+public String run() {
+    String a = activity.step1();
+    String processed = heavyProcessing(a);  // ← Replay 마다 재실행됨
+    String b = activity.step2(processed);
+    return b;
+}
+```
+
+- `activity.step1()` 결과는 history 의 `ActivityTaskCompleted` 에 저장돼 있어 replay 시 **재호출 없이 즉시 반환**된다 — Activity 코드는 다시 안 돈다.
+- 그 **"사이에 낀" `heavyProcessing(a)`** 는 history 에 아무 흔적이 없으므로 WFT 가 N 번 발생하면 **N 번 재실행**된다. 10 초짜리 CPU 로직이면 매 replay 마다 10 초씩 더 든다.
+
+### "대기" 의 의미 — workflow 는 메모리에 떠 있지 않다
+
+`String a = activity.step1();` 에서 workflow 가 "activity 를 기다린다" 는 건 **어느 JVM 도 workflow 객체를 메모리에 붙잡고 있지 않다** 는 뜻이다. SDK 는 `ScheduleActivityTask` 커맨드를 서버로 flush 하고 **workflow 는 메모리에서 사라진다**. Activity 는 다른 JVM(또는 같은 Worker 의 Activity Executor slot) 이 Task Queue 에서 꺼내 실행. 결과가 history 에 기록되고 새 WFT 가 스케줄되면 **어느 Worker 든** 받아 workflow 코드를 처음부터 replay — `activity.step1()` 지점에 도달하면 history 에서 결과를 꺼내 즉시 반환해 다음 줄로 진행. 이 메커니즘 덕에 몇 달 걸리는 workflow 도 메모리/스레드 비용 없이 수백만 개 띄울 수 있다. (상세 메커니즘은 [11 Worker 실행 모델](temporal/11-worker-execution-model.md), [14 상태머신](temporal/14-state-machines.md), [05 Async 의 Promise ↔ history 매핑](temporal/05-concurrency.md).)
+
+### 피하는 방법
+
+- **Activity 로 분리** — 결과가 history 에 기록돼 replay 시 재실행 안 됨(정석). 시간이 걸리거나 side effect 있는 코드는 전부 activity.
+- **Local Activity** (`Workflow.newLocalActivityStub`) — Task Queue 안 거치고 Worker 프로세스 안에서 바로 실행, 결과는 history 에 marker 로 저장 → replay 시 skip. 수 초 이내 짧고 자주 호출되는 로직용.
+- `Workflow.sideEffect` / `mutableSideEffect` — UUID / 현재 시간 / 랜덤 등 단순 비결정적 값, 한 번만 실행 후 결과를 history 에 저장.
+
+### Workflow 코드에 남겨도 되는 것 vs 빼야 하는 것
+
+| 남겨도 OK | 빼야 함 (Activity/LocalActivity/SideEffect) |
+| --- | --- |
+| if/else, 루프, activity 호출 조립 (오케스트레이션) | 시간이 걸리는 모든 계산 |
+| 수 ms 이내 데이터 변환 | I/O (DB, HTTP, 파일) |
+| `Workflow.*` API (sleep, timer, random, currentTimeMillis) | 비결정적 값 (`new Date()`, `UUID.randomUUID()`, `Math.random()`) |
+|  | 외부 상태 의존 로직 |
+
+> 경험칙: **Workflow 메서드는 오케스트레이션 지시서, 실제 일은 activity 가 한다** — 이 원칙만 지키면 replay 오버헤드는 사실상 사라진다.
+
+### 결정론은 Workflow 만의 요구사항 — Activity 는 오히려 비결정적이어도 된다
+
+위 표의 "빼야 함" 열 전체는 결국 **"replay 때 무엇이 재실행되는가"** 하나로 수렴한다.
+
+| | Workflow 코드 | Activity 코드 |
+| --- | --- | --- |
+| Replay 시 재실행? | **O** (매 WFT 마다 처음부터) | **X** (history 에 결과만 꺼내 씀) |
+| 결정론 필요? | **필수** | **불필요** |
+| 비결정 코드 둬도 됨? | 안 됨 | **됨 — 오히려 여기 둬야 함** |
+
+- **Workflow 가 결정론적이어야 하는 이유** — Replay 는 "같은 history 를 재생하면 같은 Command 가 나와야 한다"는 전제로 동작한다. `new Date()` / `UUID.randomUUID()` / `Math.random()` 을 workflow 에서 쓰면 WFT 1 과 WFT 2 에서 다른 값이 나와 상태 머신이 깨지고 **non-deterministic error** 로 workflow 가 터진다.
+- **Activity 가 결정론적일 필요 없는 이유** — Activity 결과는 **딱 한 번 실행되고 history 에 영구 기록**된다. 그 뒤로는 replay 가 몇 번 돌든 SDK 는 history 에서 값을 꺼낼 뿐 Activity 코드를 **재호출하지 않는다**. 그래서 Activity 가 `UUID.randomUUID()` 를 리턴해도 history 에 박힌 그 UUID 가 영원히 정답이 된다. ← **비결정 코드를 Activity 로 격리하는 본질적 이유**.
+
+**Activity 재시도 시엔?** 각 시도가 다른 값을 뱉어도 OK — 실패한 시도는 `ActivityTaskFailed` 로 기록되고 **최종 성공한 시도의 결과만** `ActivityTaskCompleted(result=…)` 로 history 에 박힌다. 이후 replay 는 그 값만 반환.
+
+> **결정론 ≠ 멱등성 (별개 문제)** — Activity 가 외부 side effect (DB 쓰기, 결제 호출 등) 를 가지면 재시도 시 **중복 실행**될 수 있으므로 **멱등성(idempotency key)** 는 Activity 작성자가 따로 책임져야 한다. Temporal 이 보장해주는 "결정론"(= workflow replay 일관성) 과는 별개 레이어.
+
+### Workflow 코드에서 쓸 수 있는 결정론 대체 API
+
+"간단한 비결정 값 하나" 가 필요한데 Activity 띄우긴 과한 경우를 위해 SDK 가 제공하는 **결정론적** 래퍼:
+
+- `Workflow.currentTimeMillis()` — replay 시 저장된 값 반환
+- `Workflow.randomUUID()`, `Workflow.newRandom(seed)`
+- `Workflow.sideEffect(() -> ...)` / `Workflow.mutableSideEffect(...)` — 한 번만 실행, 결과를 history 에 저장
+
+무거운 건 그냥 Activity.
+
+→ 상세: [08 고급](temporal/08-advanced.md) (`SideEffect` / `mutableSideEffect`), [03 Activity](temporal/03-activity.md) (`LocalActivityOptions`).
+
+---
+
 ## 자주 가는 길
 
 - **"Temporal을 처음 본다"** → [00](temporal/00-getting-started.md) → [01](temporal/01-setup.md) → [02](temporal/02-workflow-options.md) → [03](temporal/03-activity.md)
@@ -151,6 +220,10 @@ WorkflowClient.start(workflow::getGreeting);   // 이 라인에서 메서드 바
 - **"`WorkflowClient.start` / `WorkflowClient.execute` / `stub.메서드()` 직접 호출 — 셋 다 `StartWorkflowExecution` gRPC는 같은데 뭐가 다른가"** → [02 §A.1](temporal/02-workflow-options.md) (요약: `start`=fire-and-forget `WorkflowExecution` 메타만, `execute`=`CompletableFuture<T>` 비동기 결과, 직접 호출=동기 블로킹. 내부적으로 `execute` ≈ `start` + 결과 Long-poll)
 - **"`Async.function`과 `WorkflowClient.start` — 겉모양(메서드 참조 받아 비동기 시작)은 같은데 뭐가 다른가"** → [11 Stub은 "리모컨"](temporal/11-worker-execution-model.md) + [05 Async](temporal/05-concurrency.md) (요약: `Async.function`은 **워크플로 내부**에서 Command를 쌓고 `Promise<T>` 반환, `WorkflowClient.start`는 **외부 클라이언트 코드**에서 gRPC로 top-level 워크플로 시작. 전자는 Activity/ChildWorkflow/local activity stub 모두에 쓰고, 후자는 Child를 만들 수 없음)
 - **"`Async.function`이 돌려준 `Promise<T>` 는 서버 통신 결과인가? 실제 activity 실행값과 어떻게 연결되나 (replay / durable execution 의 본질)"** → [05 Async](temporal/05-concurrency.md) + [11 Worker 실행 모델](temporal/11-worker-execution-model.md) (요약: Promise 는 **network callback 이 아니라 command seq=N 과 묶인 placeholder**. `Async.function` 호출 자체는 gRPC 를 쏘지 않고 커맨드 버퍼에 `ScheduleActivityTask(seq=N)` 를 쌓을 뿐이며, `Promise.anyOf(results).get()` 이 블록되면 워커는 지금까지의 커맨드를 `RespondWorkflowTaskCompleted` 로 **한 번에** 서버로 보내고 WFT #1 종료 — workflow 객체는 메모리에서 사라짐. Activity worker 가 다른 호스트에서 실행 후 결과를 서버에 보고하면 history 에 `ActivityTaskCompleted(seq=N, result=…)` 가 기록되고 새 WFT 가 스케줄됨. WFT #2 에서 워크플로 코드는 **처음부터 재실행(replay)**, `Async.function` 재호출로 재구성된 Promise 들에 대해 SDK 가 history 를 매칭 — seq=N 이 history 에 완료 상태로 있으면 Promise 는 즉시 resolved 로 복원되어 `.get()` 이 결과 반환. 결론: Promise ↔ activity 결과의 연결 매개체는 **"서버 history"** 이고, workflow 가 여러 WFT 에 걸쳐 replay 되면서 상태가 보존되는 것이 바로 Temporal 의 **durable execution** — 워커가 중간에 죽어도 다른 워커가 history 를 replay 해 동일 Promise 상태로 복원됨)
+- **"workflow 메서드 안에 activity 호출 사이에 CPU 로직(가공·암호화·정렬 등)을 넣으면 replay 마다 재실행되나? / 어떻게 피하나"** → [08 고급](temporal/08-advanced.md) + [03 Activity](temporal/03-activity.md) (요약: 그렇다. workflow 는 매 WFT 마다 코드를 **처음부터 replay** 하므로 workflow 메서드 안의 모든 순수 로직은 재실행된다 — Activity 결과는 history 에 저장돼 재호출 시 즉시 반환되지만, 그 **"사이에 낀" 일반 Java 코드는 history 흔적이 없어 매 WFT 마다 다시 돈다**. 10초짜리 CPU 로직이면 매 replay 마다 10초씩 추가. 해결: ① **Activity 로 분리** — 결과가 history 에 기록돼 replay 시 재실행 안 됨(정석, 시간이 걸리거나 side effect 있는 코드 전부), ② **Local Activity** (`Workflow.newLocalActivityStub` — Task Queue 안 거치고 Worker 안에서 바로 실행, 결과는 marker 로 history 에 저장 → replay 시 skip; 수 초 이내 짧고 자주 호출되는 로직), ③ `Workflow.sideEffect`/`mutableSideEffect` (UUID / 현재 시간 / 랜덤 등 단순 비결정적 값, 한 번 실행 후 결과 저장). 원칙: **Workflow 메서드는 오케스트레이션 지시서, 실제 일은 activity 가 한다** — workflow 코드에는 빠르고 결정론적인 제어 흐름(if/else, 루프, activity 호출 조립)과 ms 단위 변환만 남긴다)
+- **"`activity.step1()` 같은 **동기** 호출일 때도 workflow 가 메모리에서 사라지고 replay 로 복원되나? (JVM 이 activity 결과를 블로킹 대기하는 게 아닌가)"** → [11 Worker 실행 모델](temporal/11-worker-execution-model.md) + [14 상태머신](temporal/14-state-machines.md) (요약: 그렇다. `stub.step1()` 도 내부적으로 `Async.function` 과 같은 경로 — SDK 가 `ScheduleActivityTask` 커맨드를 버퍼에 쌓고 `RespondWorkflowTaskCompleted` 로 flush 하면 **workflow 객체는 메모리에서 사라진다**. 어느 JVM 도 workflow 를 붙잡고 있지 않음. Activity 는 다른 JVM(또는 같은 Worker 의 Activity Executor slot) 이 Task Queue 에서 꺼내 실행. 결과가 history 에 기록되고 새 WFT 가 스케줄되면 **어느 Worker 든** 받아 workflow 코드를 **처음부터 replay** — `activity.step1()` 지점에 도달하면 저장된 결과를 즉시 반환해 다음 줄로 진행. "wait" 는 Thread blocking 이 아니라 **서버 history 의 상태 전이**. Workflow/Activity 는 **다른 Worker, 다른 머신**에서 실행 가능 — Workflow Worker ↔ Activity Worker 가 TaskQueue 로만 연결된 독립 프로세스로 분리하는 게 프로덕션 패턴)
+- **"Activity 도 결정론적이어야 하나? (같은 input → 같은 output 보장?) / `UUID.randomUUID()` 같은 거 Activity 안에서 써도 되나? / Activity 재시도 시 값이 달라져도 괜찮나?"** → 위 "개념 파악 — Replay 비용과 Activity 분리 원칙" §결정론 (요약: 아니다. **반대다** — 결정론은 **Workflow 만의 요구사항**. Workflow 는 replay 때 코드가 재실행되므로 `new Date()`/`UUID.randomUUID()` 를 쓰면 WFT 간 Command 가 달라져 **non-deterministic error** 로 터진다. Activity 는 결과가 **딱 한 번 실행되고 history 에 영구 기록** 되므로 replay 가 몇 번 돌든 SDK 는 history 값만 반환할 뿐 **Activity 코드를 재호출하지 않는다** — 그래서 Activity 안의 비결정 코드는 자유. 바로 이게 비결정 코드를 Activity 로 격리하는 본질적 이유. 재시도도 마찬가지 — 시도마다 다른 값이 나와도 OK, **최종 성공한 시도의 결과만** `ActivityTaskCompleted` 로 history 에 박혀 그게 영원한 정답이 된다. **단, 결정론 ≠ 멱등성** — 외부 side effect(DB 쓰기, 결제) 가 있는 Activity 는 재시도 중복 실행 대비 idempotency key 를 Activity 작성자가 따로 책임져야 한다. 이건 결정론과 별개 레이어)
+- **"workflow 안에서 간단한 비결정 값 하나 (현재 시간, 랜덤, UUID) 가 필요한데 Activity 띄우긴 과하다 — 결정론적 대체 API 는?"** → [08 고급](temporal/08-advanced.md) + 위 "개념 파악 — Replay 비용" §결정론 대체 API (요약: `Workflow.currentTimeMillis()` / `Workflow.randomUUID()` / `Workflow.newRandom(seed)` 는 **결정론적** 래퍼 — replay 시 저장된 값 반환. 더 범용으로는 `Workflow.sideEffect(() -> ...)` / `Workflow.mutableSideEffect(...)` 가 임의 비결정 코드를 한 번 실행하고 결과를 history 에 저장. 복잡·무거운 비결정 로직은 그냥 Activity 로 분리)
 - **"Activity 안에서 다른 워크플로를 fire-and-forget으로 띄우고 싶다 (부모-자식 관계 없이 독립 실행)"** → [04 Composition](temporal/04-composition.md) + ChildWorkflow 대안으로 `WorkflowClient` 주입 → Activity Impl 내부에서 `WorkflowClient.start(stub::method, ...)` 호출. **멱등성 필수**: 결정론적 `workflowId` + `WorkflowIdReusePolicy.ALLOW_DUPLICATE` + `WorkflowExecutionAlreadyStarted` 캐치 (Activity at-least-once 재시도 대비)
 - **"child/sibling 워크플로가 끝날 때 결과를 부모에게 돌려주고 싶다 (`Workflow.await` + Signal 콜백 패턴)"** → [06 Signal](temporal/06-messaging.md) (부모가 자기 `Workflow.getInfo().getWorkflowId()`를 자식에게 넘김 → 자식이 `Workflow.newExternalWorkflowStub(ParentWorkflow.class, parentId)`로 Signal → 부모는 `Workflow.await(Duration, () -> result != null)`로 대기. **반드시 성공/실패 공통 Signal + await 타임아웃** 걸기)
 - **"`signalWithStart` 유즈케이스 — 워크플로 없으면 start+signal, 있으면 signal만 (per-user 세션 집계·debounce 등)"** → [06 §signalWithStart](temporal/06-messaging.md)의 유즈케이스 (`BatchRequest`에 `workflowMethod` + `signalMethod` 두 번 add 후 `client.signalWithStart(batch)`. "조회 후 start/signal" 수동 분기는 race condition으로 금지)

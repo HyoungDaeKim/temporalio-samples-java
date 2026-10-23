@@ -57,12 +57,12 @@ private final Queue<Message>            messageOutbox        = new ArrayDeque<>(
 
 ```mermaid
 flowchart LR
-    code["사용자 Workflow 코드<br/>activities.foo() / Workflow.newTimer() /<br/>Workflow.newChildWorkflowStub()..."] -->|SCHEDULE 트리거| cc["<b>cancellableCommands</b><br/>(WFT 처리 중 누적)"]
-    cc -->|scope.cancel() / timer.cancel()<br/>같은 WFT 안이면 큐에서 제거| gone["🗑️ (서버로 안 나감)"]
-    cc -->|prepareCommands()<br/>WFT 종료 직전| cmds["<b>commands</b><br/>(전송 확정, 순서 고정)"]
+    code["사용자 Workflow 코드<br/>activities.foo() / Workflow.newTimer() /<br/>Workflow.newChildWorkflowStub()..."] -->|"SCHEDULE 트리거"| cc["<b>cancellableCommands</b><br/>(WFT 처리 중 누적)"]
+    cc -->|"scope.cancel() / timer.cancel()<br/>같은 WFT 안이면 큐에서 제거"| gone["🗑️ (서버로 안 나감)"]
+    cc -->|"prepareCommands()<br/>WFT 종료 직전"| cmds["<b>commands</b><br/>(전송 확정, 순서 고정)"]
     upd["Update 핸들러 흐름<br/>Accepted / Completed / Rejected"] --> mo["<b>messageOutbox</b><br/>(프로토콜 메시지)"]
-    cmds -->|takeCommands()<br/>drainTo| rpc["RespondWorkflowTaskCompleted<br/>commands 필드"]
-    mo -->|drainTo| rpc2["RespondWorkflowTaskCompleted<br/>messages 필드"]
+    cmds -->|"takeCommands()<br/>drainTo"| rpc["RespondWorkflowTaskCompleted<br/>commands 필드"]
+    mo -->|"drainTo"| rpc2["RespondWorkflowTaskCompleted<br/>messages 필드"]
 ```
 
 ### 예제 데이터 — 한 WFT 안에서의 큐 변화
