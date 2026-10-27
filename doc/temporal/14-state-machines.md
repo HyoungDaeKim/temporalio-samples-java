@@ -146,19 +146,51 @@ public static class GreetingWorkflowImpl implements GreetingWorkflow {
 
 이 history 는 **두 번의 WFT** 로 나뉘어 worker 에 전달된다. WFT1 은 `#1~#3`, WFT2 는 `#4~#9` (`#10~#11` 은 WFT2 처리 결과로 서버에 저장되는 미래 이벤트).
 
+### 각 EventType 은 언제 기록되나
+
+History 이벤트는 **모두 서버가 기록**한다. 다만 계기가 다르다 — 클라이언트 시작 / 서버 자체 스케줄 / worker 의 poll / worker 의 Respond.
+
+| # | EventType | 기록 계기 | 주요 내용 |
+| --- | --- | --- | --- |
+| 1 | `WorkflowExecutionStarted` | 클라이언트 `workflow.getGreeting("World")` → `StartWorkflowExecution` RPC | 워크플로 타입, 입력 `"World"`, Task Queue, timeout, `originalExecutionRunId`. 실행의 **최초 이벤트** — 아직 코드 실행 전 |
+| 2 | `WorkflowTaskScheduled` | `#1` 직후 서버가 스스로 — "코드 돌려서 다음 할 일 결정해라" 일감을 Task Queue 에 넣음 | 이후에도 Activity 완료·Timer 발화·Signal 수신 등 **반응할 일이 생길 때마다** 기록 |
+| 3 | `WorkflowTaskStarted` | worker 가 `PollWorkflowTaskQueue` 로 `#2` 를 **가져간 순간** | `scheduledEventId=2`, worker identity, `historySizeBytes`, `suggestContinueAsNew` |
+| 4 | `WorkflowTaskCompleted` | worker 가 코드를 블록 지점(Activity 결과 대기)까지 돌리고 `RespondWorkflowTaskCompleted` 응답 | `scheduledEventId=2`, `startedEventId=3`, `sdkMetadata.langUsedFlags`, buildId, SDK 이름·버전 — `handleSingleEventLookahead` 가 읽는 정보 |
+| 5 | `ActivityTaskScheduled` | `#4` 응답에 실린 **command**(`ScheduleActivityTask`)를 서버가 이벤트로 변환 | activityId, 타입 `composeGreeting`, 입력, Task Queue, timeout, 재시도 정책. command 와 1:1 대응하는 **command event** 라 `#4` 바로 뒤에 붙고, replay 시 결정론 검증 대상 |
+| 6 | `ActivityTaskStarted` | Activity worker 가 Activity Task 를 poll 로 가져감 | `scheduledEventId=5`, worker identity, `attempt`. ⚠️ 재시도 정책이 있으면 **최종 결과(`#7`) 직전에 함께 기록** — 재시도 중엔 history 에 안 보이고 UI 의 Pending Activity 로만 보임 |
+| 7 | `ActivityTaskCompleted` | Activity worker 가 `composeGreeting()` 실행 후 `RespondActivityTaskCompleted` | `scheduledEventId=5`, `startedEventId=6`, result `"Hello World!"`. 실패면 `ActivityTaskFailed`, 타임아웃이면 `ActivityTaskTimedOut` |
+| 8 | `WorkflowTaskScheduled` | `#7` 로 워크플로가 반응할 일(블록된 `composeGreeting()` 지점 깨우기)이 생겨 서버가 새 WFT 스케줄 | `#2` 와 같은 종류, 원인만 다름 |
+| 9 | `WorkflowTaskStarted` | worker 가 `#8` 을 poll 로 가져감 | worker 가 받은 history 의 **마지막 이벤트** — 아직 Completed 안 된 지금 처리 중인 WFT |
+| 10 | `WorkflowTaskCompleted` | worker 가 코드를 재개해 `return` 까지 실행 후 응답 | — |
+| 11 | `WorkflowExecutionCompleted` | `#10` 응답의 `CompleteWorkflowExecution` command 에 대응하는 command event | 결과 `"Hello World!"` |
+
+```
+클라이언트 시작 ─→ #1
+서버 WFT 스케줄 ─→ #2
+worker poll     ─→ #3
+worker 응답      ─→ #4 + #5 (command event)
+Activity poll   ─→ #6
+Activity 응답    ─→ #7
+서버 WFT 스케줄 ─→ #8
+worker poll     ─→ #9
+worker 응답      ─→ #10 + #11 (command event)
+```
+
+직접 확인: 샘플 실행 후 `temporal workflow show -w HelloActivityWorkflow`.
+
 ### WFT1 — 사용자 코드가 처음 실행되는 순간
 
 | 순서 | 사용자 코드 / SDK 내부 동작 | State machine 변화 | 큐 상태 |
 | --- | --- | --- | --- |
-| ① history `#1` 수신 | `handleNonStatefulEvent(WorkflowExecutionStarted)` → `callbacks.start(event)` → **`getGreeting("World")` 메서드 호출** | — | `cancellableCommands`: `[]` |
-| ② 사용자 코드 `activities.composeGreeting(...)` | `scheduleActivityTask()` → `ActivityStateMachine.newInstance()` → `SCHEDULE` 투입 | `CREATED → SCC` | `cancellableCommands`: `[ScheduleActivityTask(greet-1)]` |
-| ③ Promise `.get()` 에서 block | workflow thread 양보 | — | — |
-| ④ history `#2` 수신 | `WorkflowTaskStateMachine` 신규 생성, `stateMachines.put(2, sm)` | WFT SM: `CREATED → SCHEDULED` | — |
-| ⑤ history `#3` 수신 (= WFT 끝) | `stateMachines.get(2)` 라우팅 → `handleStarted()` | WFT SM: `SCHEDULED → STARTED` → (lookahead `handleCompleted()`) | — |
-| ⑥ `prepareCommands()` 호출 | 큐에 쌓인 command 를 외부 반출용 큐로 이동 | `SCC → SCC` (self, `addCommand()` 훅) | `cancellableCommands → commands`: `[ScheduleActivityTask]` |
+| ① history `#1` 수신 | `handleNonStatefulEvent(WorkflowExecutionStarted)` → `callbacks.start(event)` → workflow 인스턴스 생성·입력 보관만. **사용자 코드는 아직 실행 안 됨** | — | `cancellableCommands`: `[]` |
+| ② history `#2` 수신 | `WorkflowTaskStateMachine` 신규 생성, `stateMachines.put(2, sm)` | WFT SM: `CREATED → SCHEDULED` | — |
+| ③ history `#3` 수신 (= history 마지막, `hasNextEvent=false`) | `stateMachines.get(2)` 라우팅 → `handleStarted()` → 마지막 WFT 라 `handleCompleted()` 즉시 호출 → `listener.workflowTaskStarted()` → **`eventLoop()` → 여기서 비로소 `getGreeting("World")` 실행** | WFT SM: `SCHEDULED → STARTED` (Completed 이벤트 없이 listener 선발사) | — |
+| ④ 사용자 코드 `activities.composeGreeting(...)` | `scheduleActivityTask()` → `ActivityStateMachine.newInstance()` → `SCHEDULE` 투입 | `CREATED → SCC` | `cancellableCommands`: `[ScheduleActivityTask(greet-1)]` |
+| ⑤ Promise `.get()` 에서 block | workflow thread 양보 → `callbacks.eventLoop()` 리턴 | — | — |
+| ⑥ `prepareCommands()` 호출 (`eventLoop()` 끝에서) | 큐에 쌓인 command 를 외부 반출용 큐로 이동 | `SCC → SCC` (self, `handleCommand()` 훅) | `cancellableCommands → commands`: `[ScheduleActivityTask]` |
 | ⑦ worker `takeCommands()` | 서버로 응답 전송 | — | 비워짐 |
 
-**핵심**: 사용자가 `activities.composeGreeting(...)` 을 호출한 그 순간엔 서버 통신이 전혀 없다. command 는 workflow 메모리의 `cancellableCommands` 큐에만 있고, WFT 가 끝날 때 batch 로 서버에 보내진다.
+**핵심**: 사용자 코드는 `WorkflowExecutionStarted` 가 아니라 **`WorkflowTaskStarted` 처리 중 `eventLoop()`** 에서 실행된다. 또 `activities.composeGreeting(...)` 을 호출한 그 순간엔 서버 통신이 전혀 없다. command 는 workflow 메모리의 `cancellableCommands` 큐에만 있고, WFT 가 끝날 때 batch 로 서버에 보내진다.
 
 ### WFT2 — Activity 완료 후, workflow 완결까지
 
@@ -175,6 +207,40 @@ history `#4~#9` 가 한 batch 로 들어온다. `#4~#5` 는 WFT1 결과가 서�
 | ⑦ `takeCommands()` | 서버로 `CompleteWorkflowExecution` command 전송 | — |
 
 **핵심**: `#5` 처리 시점의 "큐에서 peek 한 command" vs "history 에서 들어온 command event" 매칭이 **결정론 검증의 모든 것**. 사용자 코드가 매번 다른 activityId 를 생성하면 ② 에서 `validateCommand()` 가 깨지고 `NonDeterministicException` 이 터진다.
+
+### `#7 → #8` 사이 — Sticky worker vs 새 worker
+
+위 WFT2 표는 **sticky** 경로(같은 worker, 캐시 유지)를 가정한 것이다. `#7 ActivityTaskCompleted` 로 서버가 `#8 WorkflowTaskScheduled` 를 만들 때, 그 Task 를 **어느 큐에 넣느냐** 에서 경로가 갈린다.
+
+| | Sticky (같은 worker, 캐시 있음) | 새 worker (또는 캐시 없음) |
+| --- | --- | --- |
+| Task 가 들어가는 큐 | 그 worker 전용 **sticky queue** | 일반 Task Queue (`HelloActivityTaskQueue`) |
+| 서버가 보내는 history | 이전 WFT 이후 **새 이벤트만** (`#4~#9`) | **전체 history** (`#1~#9`) |
+| worker 메모리 | `WorkflowStateMachines` + workflow thread 가 캐시에 살아있음 | 없음 → 새로 생성 |
+| 실행 방식 | 블록돼 있던 지점에서 **이어서 실행** | **처음부터 replay** |
+
+**Sticky — "activity 완료 이후" 가 아니라 "블록돼 있던 지점" 부터 재개**
+
+캐시된 workflow thread 는 WFT1 끝에서 `activities.composeGreeting(...)` 안의 Promise `.get()` 에서 멈춰 있다. `#7` 처리로 그 Promise 가 complete 되고, `#9` 처리 중 `eventLoop()` 가 돌 때 thread 가 깨어나 **`composeGreeting` 리턴값을 받는 바로 그 줄부터** 계속 진행한다. 코드 재실행 없음.
+
+**새 worker — 처음부터 실행하지만 Activity 는 다시 실행하지 않음**
+
+`getGreeting("World")` 를 첫 줄부터 다시 돌리지만, replay 중에는:
+
+- `composeGreeting(...)` 호출 → `ScheduleActivityTask` command 생성 → **서버로 안 나가고** history `#5` 와 매칭(결정론 검증)만.
+- 결과 `"Hello World!"` 는 history `#7` 에서 꺼내 Promise 에 채움.
+- 즉 **Activity 코드(실제 side effect)는 재실행되지 않고**, workflow 코드만 재실행해 메모리 상태를 복원한다.
+- `handleEventsBatch` 관점에서는 배치 `[#1~#5]` (WFTCompleted 포함 → lookahead + replay) → 배치 `[#6~#9]` (마지막 배치 → `isLastTask=true` 라 `#6` 에서 `replaying=false` 전환) 순으로 처리된다.
+
+**"새 worker" 가 아니어도 처음부터 replay 되는 경우** — 같은 worker 라도 전체 history 를 받는다:
+
+- **Sticky timeout** — sticky queue 의 Task 를 `stickyQueueScheduleToStartTimeout` (기본 5초) 안에 poll 못 하면 서버가 일반 큐로 재스케줄.
+- **캐시 evict** — `WorkerFactoryOptions.workflowCacheSize` (기본 600) 초과, workflow thread 부족 등.
+- **worker 재시작**, **직전 WFT 실패**.
+
+반대로 새 worker 가 일반 큐에서 받아 replay 를 끝내면 **그 worker 가 새 sticky worker** 가 된다.
+
+> Sticky 는 replay 를 생략하는 **성능 최적화** 일 뿐이다. 어느 경로를 타든 결과는 같아야 하고, 그걸 보장하는 장치가 결정론 검증이다.
 
 ## 핵심 설계 포인트
 
@@ -254,7 +320,7 @@ stateDiagram-v2
 
 **읽기 포인트**:
 
-- `SCC → SCC` self transition 은 `addCommand()` 호출로 "command 를 외부 큐에 넣는 그 순간" 을 포착하는 훅. 실제 상태값은 그대로.
+- `SCC → SCC` self transition 은 `prepareCommands()` 가 `command.handleCommand(commandType)` 을 호출해 "command 를 `cancellableCommands` → `commands` (반출 확정 큐) 로 옮기는 그 순간" 을 포착하는 훅. 실제 상태값은 그대로. (`addCommand()` 는 그보다 앞서 `CREATED → SCC` 전이 액션 안에서 command 를 `cancellableCommands` 에 넣기만 한다.)
 - `SER` 는 서버가 `ActivityTaskScheduled` 이벤트를 history 에 적어 승인한 상태. 아직 worker 가 polling 전.
 - `SER → TIMED_OUT` 은 ScheduleToStart 타임아웃 (polling 되지 못하고 타임아웃), `STARTED → TIMED_OUT` 은 StartToClose/Heartbeat 타임아웃.
 
@@ -419,14 +485,15 @@ stateDiagram-v2
 | `TRY_CANCEL` | cancel command가 큐에 들어가거나 서버가 `CancelRequested` 를 돌려준 **즉시** CanceledFailure 통지 |
 | `WAIT_CANCELLATION_COMPLETED` | 서버가 `ActivityTaskCanceled` 를 돌려줄 때까지 **대기** 후 통지 |
 
-**Self-transition (`SCC → SCC`, `SACCC → SACCC`, `STACCC → STACCC`)** — StateMachine 공통 로직에서 `addCommand()` 호출 시 해당 CommandType으로 자기 자신에게 전이가 들어온다. "command를 외부 큐에 넣은 바로 그 순간"을 포착하기 위한 훅으로, 각 self transition 에 걸린 `notifyCanceledIfTryCancel*` 핸들러가 `TRY_CANCEL` 모드의 즉시 통지를 담당한다.
+**Self-transition (`SCC → SCC`, `SACCC → SACCC`, `STACCC → STACCC`)** — `WorkflowStateMachines.prepareCommands()` 가 `cancellableCommands` 의 각 command 에 대해 `command.handleCommand(commandType)` → `EntityStateMachineBase.handleCommand()` 를 호출하면 해당 CommandType으로 자기 자신에게 전이가 들어온다. (`addCommand()` 는 command 를 `cancellableCommands` 에 넣기만 할 뿐 전이를 일으키지 않는다.) "command를 반출 확정 큐(`commands`)로 옮긴 바로 그 순간"을 포착하기 위한 훅으로, 각 self transition 에 걸린 `notifyCanceledIfTryCancel*` 핸들러가 `TRY_CANCEL` 모드의 즉시 통지를 담당한다.
 
 **`WorkflowStateMachines` 와의 연결 지점**:
 
 | 시점 | WorkflowStateMachines 동작 | ActivityStateMachine |
 | --- | --- | --- |
 | 사용자 코드 `activity.foo()` | `scheduleActivityTask()` → `newInstance()` → `SCHEDULE` explicit 투입 | `CREATED → SCC` |
-| `takeCommands()` | SCC 의 Schedule command 반출 | `SCC → SCC` (self) |
+| `prepareCommands()` (`eventLoop()` 끝) | `cancellableCommands → commands` 이동, `handleCommand()` 호출 | `SCC → SCC` (self) |
+| `takeCommands()` | `commands` 를 drain 해 서버로 반출 | — |
 | history: `ActivityTaskScheduled` | `handleCommandEvent` → 매칭 → `stateMachines.put(eventId, sm)` | `SCC → SER` |
 | history: `ActivityTaskStarted` | `stateMachines.get(scheduledEventId)` → `sm.handleEvent` | `SER → STARTED` |
 | history: `ActivityTaskCompleted` | 동일 라우팅. SM 이 final → `stateMachines.remove()` | `STARTED → COMPLETED*` |
@@ -467,7 +534,7 @@ stateDiagram-v2
 **읽기 포인트**:
 
 - Activity 와 달리 **중간 `STARTED` 상태가 없다** — 서버가 timer 를 혼자 돌리기 때문. history 에도 `TimerStarted → TimerFired` 두 이벤트뿐.
-- `SCC → SCC` self transition 은 Activity 와 같은 패턴 — `addCommand()` 호출로 command 를 외부 큐에 넣는 순간을 포착.
+- `SCC → SCC` self transition 은 Activity 와 같은 패턴 — `prepareCommands()` 의 `handleCommand()` 호출로 command 가 `commands` (반출 확정 큐) 로 옮겨지는 순간을 포착.
 - `SCR → FIRED` 가 서버가 타이머를 발화시킨 시점. 이때 `notifyCompletion` 이 Promise 를 complete.
 
 ### B. Cancel 두 경로 — 서버 통신 전 vs 서버 통신 후
@@ -569,13 +636,13 @@ cancellationScope.run();                                    // Activity 블록 �
 | 시점 | Activity SM | Timer SM | 비고 |
 | --- | --- | --- | --- |
 | WFT1: 사용자 코드 실행 | `CREATED → SCC` | `CREATED → SCC` | 두 command 가 큐에 push |
-| WFT1 끝: `takeCommands()` | `SCC → SCC` (self) | `SCC → SCC` (self) | `ScheduleActivityTask` + `StartTimer` 둘 다 서버로 |
+| WFT1 끝: `prepareCommands()` → `takeCommands()` | `SCC → SCC` (self) | `SCC → SCC` (self) | `ScheduleActivityTask` + `StartTimer` 둘 다 서버로 |
 | WFT2: `ActivityTaskScheduled` | `SCC → SER` | — | — |
 | WFT2: `TimerStarted` | — | `SCC → SCR` | — |
 | WFT2: `ActivityTaskStarted` | `SER → STARTED` | — | activity worker 가 heartbeat 시작 |
 | WFT3 (3초 뒤): `TimerFired` | — | `SCR → FIRED` → `notifyCompletion` | timer promise 깨어남 → `thenApply` 람다 실행 → `scope.cancel()` 호출 |
 | 같은 WFT 내: `scope.cancel()` 효과 | `STARTED → STACCC` | — | `RequestCancelActivityTask` command push |
-| WFT3 끝: `takeCommands()` | `STACCC → STACCC` (self) | — | 서버로 cancel 요청 전송 |
+| WFT3 끝: `prepareCommands()` → `takeCommands()` | `STACCC → STACCC` (self) | — | 서버로 cancel 요청 전송 |
 | WFT4: `ActivityTaskCancelRequested` | `STACCC → STACER` | — | — |
 | WFT4+: 서버 결과 | `STACER → CANCELED` (또는 COMPLETED — 레이스) | — | activity 가 heartbeat 로 cancel 받고 cleanup 후 throw → CANCELED |
 
