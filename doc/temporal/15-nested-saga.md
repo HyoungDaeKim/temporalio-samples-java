@@ -42,9 +42,9 @@ flowchart TD
     P --> IL
     P --> PAY
     P -. "payment 실패 시<br/>parentSaga.compensate()<br/>(parallel)" .-> DU
-    P -. .-> IU
+    P -.-> IU
     DL -. "자식 내부 실패 시<br/>leg Saga가 자기만 롤백" .-> DL
-    IL -. .-> IL
+    IL -.-> IL
 ```
 
 ### 두 가지 실패 경로
